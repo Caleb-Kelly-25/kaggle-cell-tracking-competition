@@ -30,6 +30,16 @@ uv sync
 
 ## Running scripts
 
+### Exploratory data analysis
+
+Characterise the ground-truth graphs — size, annotation sparsity, division
+rate, and per-edge displacement (relevant to the 7 µm node-match radius). Reads
+only `.geff` graphs plus `.zarr` metadata (no volumes are loaded):
+
+```bash
+uv run python scripts/eda.py --data-dir data/train --out-csv results/eda.csv
+```
+
 ### Training
 
 ```bash

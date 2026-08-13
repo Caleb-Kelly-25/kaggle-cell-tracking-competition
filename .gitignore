@@ -19,6 +19,9 @@ videos/
 .vscode/
 .idea/
 
+# Local agent config
+.claude/
+
 # Local config
 .env
 /kaggle_csvs

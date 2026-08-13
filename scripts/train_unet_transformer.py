@@ -530,11 +530,22 @@ def compute_detection_loss(
     coords: torch.Tensor,
     mask: torch.Tensor,
     neg_weight: float = 0.1,
+    loss_type: str = "bce",
+    pu_gate_power: float = 2.0,
 ) -> torch.Tensor:
-    """BCE detection loss: GT node voxels are positive, all others lightly penalised.
+    """Detection loss over a sparse, positive-only GT.
 
-    Positive and negative terms are normalised by count so that each
-    contributes unit magnitude before *neg_weight* scaling.
+    ``loss_type="bce"`` (baseline): GT node voxels are positive, every other
+    voxel is a lightly-weighted negative (*neg_weight*). Positive and negative
+    terms are normalised by count so each contributes unit magnitude before
+    *neg_weight* scaling.
+
+    ``loss_type="pu"``: positive-unlabeled. Non-GT voxels are treated as
+    *unlabeled* (background mixed with unannotated cells); their negative penalty
+    is scaled by ``(1 - p) ** pu_gate_power`` with ``p`` the detached detection
+    probability. Voxels the network already believes are cells -- likely
+    unannotated GT -- are barely penalised, so sparse labels stop suppressing
+    recall. ``pu_gate_power=0`` recovers the ``bce`` behaviour.
 
     Parameters
     ----------
@@ -546,6 +557,11 @@ def compute_detection_loss(
         (B, max_nodes) boolean mask for real (non-padded) nodes.
     neg_weight : float
         Weight for negative (non-GT) voxels.  Positives get weight 1.0.
+    loss_type : str
+        ``"bce"`` (baseline) or ``"pu"`` (positive-unlabeled). See summary above.
+    pu_gate_power : float
+        Exponent of the ``(1 - p)`` negative-loss gate used when
+        ``loss_type="pu"``. Higher = spare more confident voxels. 0 = off.
     """
     B = det_logits.shape[0]
     spatial = det_logits.shape[2:]  # (Z, Y, X)
@@ -580,6 +596,15 @@ def compute_detection_loss(
     w_pos = (1.0 / n_pos).reshape(shape)
     w_neg = (neg_weight / n_neg).reshape(shape)
     weight = torch.where(target == 1.0, w_pos, w_neg)
+
+    if loss_type == "pu" and pu_gate_power > 0:
+        # PU: down-weight the negative term on voxels that already look like cells
+        # (probably unannotated GT), so sparse labels don't suppress recall.
+        p = torch.sigmoid(logits).detach()
+        gate = (1.0 - p).clamp(min=0.0) ** pu_gate_power
+        weight = torch.where(target == 1.0, weight, weight * gate)
+    elif loss_type not in ("bce", "pu"):
+        raise ValueError(f"Unknown detection loss_type: {loss_type!r}")
 
     return F.binary_cross_entropy_with_logits(
         logits, target, weight=weight, reduction="sum",
@@ -788,6 +813,8 @@ def train_epoch(
     det_neg_weight: float = 0.1,
     max_iters: int | None = None,
     pool_kernel_um: float = 5.0,
+    detection_loss: str = "bce",
+    pu_gate_power: float = 2.0,
 ) -> tuple[float, float]:
     """Train for one epoch, return (avg edge loss, avg detection loss).
 
@@ -836,6 +863,7 @@ def train_epoch(
             compute_detection_loss(
                 det_logits[i], coords[:, i], masks[:, i],
                 det_neg_weight,
+                loss_type=detection_loss, pu_gate_power=pu_gate_power,
             )
             for i in range(W)
         ]
@@ -1013,6 +1041,8 @@ def train(
     downsample: tuple[int, ...] = (1, 4, 4),
     det_loss_weight: float = 1e1,
     det_neg_weight: float = 1e-2,
+    detection_loss: str = "bce",
+    pu_gate_power: float = 2.0,
     max_iters: int | None = None,
     debug_video: Path | None = None,
     seed: int | None = None,
@@ -1163,13 +1193,15 @@ def train(
     best_score = 0.0
     save_path = output_dir / "edge_predictor_best.pth"
     pbar = tqdm(range(n_epochs), desc="Training", disable=False)
-    print(f"Detection loss: weight={det_loss_weight}, neg_weight={det_neg_weight}", flush=True)
+    print(f"Detection loss: type={detection_loss}, weight={det_loss_weight}, "
+          f"neg_weight={det_neg_weight}, pu_gate_power={pu_gate_power}", flush=True)
 
     for epoch in pbar:
         t0 = time.monotonic()
         edge_loss, det_loss = train_epoch(
             model, train_loader, optimizer, device, det_loss_weight, det_neg_weight,
             max_iters=max_iters, pool_kernel_um=pool_kernel_um,
+            detection_loss=detection_loss, pu_gate_power=pu_gate_power,
         )
         train_time = time.monotonic() - t0
 
@@ -1238,6 +1270,11 @@ def main() -> None:
                         help="Weight for detection loss relative to edge loss (default: 1e1).")
     parser.add_argument("--det-neg-weight", type=float, default=1e-2,
                         help="Per-voxel weight for non-GT (negative) voxels in detection loss (default: 1e-2).")
+    parser.add_argument("--detection-loss", type=str, default="bce", choices=["bce", "pu"],
+                        help="Detection loss: 'bce' (baseline) or 'pu' (positive-unlabeled; "
+                             "gates the negative penalty on likely-unannotated cells). Default: bce.")
+    parser.add_argument("--pu-gate-power", type=float, default=2.0,
+                        help="Exponent of the (1-p) negative-loss gate for --detection-loss pu (default: 2.0).")
     parser.add_argument("--max-iters", type=int, default=None,
                         help="Max training iterations per epoch. None = full epoch.")
     parser.add_argument("--debug-video", type=str, default=None,
@@ -1282,6 +1319,8 @@ def main() -> None:
             downsample=downsample,
             det_loss_weight=args.det_loss_weight,
             det_neg_weight=args.det_neg_weight,
+            detection_loss=args.detection_loss,
+            pu_gate_power=args.pu_gate_power,
             max_iters=args.max_iters,
             debug_video=debug_video,
             window_size=args.window_size,
