@@ -153,3 +153,29 @@ baseline for the Biohub cell-tracking competition. Newest entries at the bottom.
   caps disabled) — the only change so far actually *executed*, not just
   syntax-checked. Inference-only, so it stacks with count calibration at no
   training cost.
+- **Built + unit-tested: `prune_nodes_by_support`** (`--min-track-nodes`, default 2)
+  and the **results logger** (`--log-csv`, `--run-name`).
+  - Node pruning rests on a *provable* point: only **edges** score, so an isolated
+    node can never produce a TP yet still inflates `N_pred` and pays the node-count
+    penalty. Dropping it is strictly score-improving — edge TP/FP/FN untouched,
+    penalty shrinks. Default 2 drops isolated nodes only; larger values also discard
+    short fragments, trading a possible TP edge for a smaller node count (sweep,
+    don't assume). Applied *after* the ILP, which can leave nodes unlinked.
+  - Logger appends config -> CV score per run so the Tier-1 sweep is comparable.
+  - Both verified locally against the real source (stub graph; real CSV round-trip).
+
+### Priority (competition-first, publication secondary)
+Rank by (expected gain per GPU-hour) x P(works), not novelty.
+- **Tier 1 (inference-only, ~0 GPU):** count calibration, edge pruning, node
+  pruning, `--det-tta` (already upstream, free points), threshold / pool-kernel /
+  ILP-weight sweeps.
+- **Tier 2:** train to convergence (running).
+- **Tier 3 (gated on the Phase-0 diagnosis, 1-2 runs):** resolution `1,2,2`
+  (dense-cell separation — note `(1,4,4)` is already *exactly isotropic* at
+  1.625 um, so this is about separating neighbours, not the 7 um radius);
+  PU loss A/B.
+- **Tier 4:** multi-seed/fold ensemble + TTA (boring, reliable, reserve budget).
+- **Deferred to post-deadline (the paper):** candidate-level nnPU (voxel-level
+  degenerates at pi~1e-5; at candidate level pi is O(0.1-0.9) and
+  `estimated_number_of_nodes` *gives* us the prior), track-consistency
+  self-training, controlled annotation-sparsity sweep.

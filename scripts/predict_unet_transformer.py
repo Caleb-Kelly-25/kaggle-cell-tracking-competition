@@ -78,6 +78,9 @@ class PredictConfig:
     # means our best links are the ones that survive.  0 disables a cap.
     max_out_degree: int = 2                # <=2 children (a division)
     max_in_degree: int = 1                 # <=1 parent (merges are invalid)
+    # Node support.  Only edges score, so an unlinked node earns nothing and still
+    # pays the node-count penalty; 2 drops isolated nodes (strictly beneficial).
+    min_track_nodes: int = 2
     # Edge filtering
     edge_activation: str = "softmax"  # "sigmoid" or "softmax"
     threshold: float = 0.5
@@ -203,6 +206,71 @@ def prune_edges(
         print(f"  pruned {n_dropped}/{len(edges)} edges "
               f"(non-consecutive / degree caps)", flush=True)
     return pruned
+
+
+def prune_nodes_by_support(
+    graph: td.graph.BaseGraph,
+    min_track_nodes: int = 2,
+) -> td.graph.BaseGraph:
+    """Drop nodes belonging to track fragments smaller than *min_track_nodes*.
+
+    Only *edges* score.  A node with no edges therefore cannot contribute a true
+    positive, yet it still counts toward ``N_pred`` and so pays the node-count
+    penalty ``(1 - 0.1*(N_pred - N_true)/N_true)``.  Dropping isolated nodes is
+    therefore *strictly* score-improving: edge TP/FP/FN are untouched and the
+    penalty shrinks.
+
+    ``min_track_nodes=2`` (default) removes only isolated nodes — the provably
+    beneficial case.  Larger values also discard short fragments, trading a
+    possible true-positive edge against a smaller node count: sweep, don't assume.
+    """
+    if min_track_nodes <= 1 or graph.num_nodes() == 0:
+        return graph
+
+    node_ids = list(graph.node_ids())
+
+    if min_track_nodes == 2:
+        # Isolated nodes only — degrees suffice, no component search needed.
+        out_d = graph.out_degree(node_ids)
+        in_d = graph.in_degree(node_ids)
+        keep = [n for n, o, i in zip(node_ids, out_d, in_d) if (o + i) > 0]
+    else:
+        from collections import deque
+        keep = []
+        remaining = set(node_ids)
+        while remaining:
+            seed = next(iter(remaining))
+            comp = {seed}
+            queue = deque([seed])
+            while queue:
+                cur = queue.popleft()
+                for nb in graph.successors(cur) + graph.predecessors(cur):
+                    if nb not in comp:
+                        comp.add(nb)
+                        queue.append(nb)
+            remaining -= comp
+            if len(comp) >= min_track_nodes:
+                keep.extend(comp)
+
+    n_dropped = graph.num_nodes() - len(keep)
+    if n_dropped <= 0:
+        return graph
+    print(f"  pruned {n_dropped}/{graph.num_nodes()} unsupported nodes "
+          f"(fragments < {min_track_nodes} nodes)", flush=True)
+    return graph.filter(node_ids=keep).subgraph()
+
+
+def _append_results_csv(path: Path, row: dict) -> None:
+    """Append one run's config + score to a CSV, writing the header if new."""
+    import csv
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    is_new = not path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row), extrasaction="ignore")
+        if is_new:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 # =============================================================================
@@ -604,6 +672,8 @@ def predict(
     unet_batch_size: int = 4,
     video_slice: slice | None = None,
     evaluate: bool = False,
+    log_csv: str | None = None,
+    run_name: str | None = None,
 ) -> None:
     """Run inference on the test split and save predictions as .geff files."""
     if debug_video is not None:
@@ -659,6 +729,8 @@ def predict(
             )
             with suppress_output():
                 graph = solver.solve(graph)
+        # Applied after the ILP too: the solver can leave nodes unlinked.
+        graph = prune_nodes_by_support(graph, cfg.min_track_nodes)
         save_graph(graph, output_dir / f"{name}.geff")
 
     print(f"Saved {len(test_names)} predictions to {output_dir}", flush=True)
@@ -683,6 +755,34 @@ def predict(
             f"node_recall={s['node_recall']:.4f}  (n={s['n']})",
             flush=True,
         )
+
+        if log_csv:
+            import time
+            _append_results_csv(Path(log_csv), {
+                "run": run_name or method,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "method": method,
+                "split": fold,
+                "n_videos": s["n"],
+                "score": s["score"],
+                "edge_jaccard": s["edge_jaccard"],
+                "adj_edge_jaccard": s["adj_edge_jaccard"],
+                "division_jaccard": s["division_jaccard"],
+                "node_recall": s["node_recall"],
+                "division_tp": s["division_tp"],
+                "division_fp": s["division_fp"],
+                "division_fn": s["division_fn"],
+                "det_threshold": cfg.det_threshold,
+                "pool_kernel_um": cfg.pool_kernel_um,
+                "target_nodes": cfg.target_nodes,
+                "target_nodes_from_geff": cfg.target_nodes_from_geff,
+                "max_out_degree": cfg.max_out_degree,
+                "max_in_degree": cfg.max_in_degree,
+                "min_track_nodes": cfg.min_track_nodes,
+                "use_ilp": cfg.use_ilp,
+                "weights": str(weights_path),
+            })
+            print(f"  logged run to {log_csv}", flush=True)
 
 
 # =============================================================================
@@ -732,6 +832,15 @@ def main() -> None:
     parser.add_argument("--max-in-degree", type=int, default=1,
                         help="Keep at most N incoming edges per node (default 1; merges are "
                              "biologically invalid and score as false positives). 0 disables.")
+    parser.add_argument("--min-track-nodes", type=int, default=2,
+                        help="Drop nodes in track fragments smaller than N (default 2 = drop "
+                             "isolated nodes, which can never score an edge but still pay the "
+                             "node-count penalty). 1 disables.")
+    parser.add_argument("--log-csv", type=str, default=None,
+                        help="Append this run's config and CV score to a CSV (with --evaluate), "
+                             "so experiments are comparable.")
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="Label for this run in --log-csv (defaults to --method).")
     parser.add_argument("--use-ilp", action="store_true",
                         help="Post-process the predicted graph with the tracksdata ILP "
                              "solver (global, flow-consistent linking) instead of greedy "
@@ -761,6 +870,7 @@ def main() -> None:
         target_nodes_from_geff=args.target_nodes_from_geff,
         max_out_degree=args.max_out_degree,
         max_in_degree=args.max_in_degree,
+        min_track_nodes=args.min_track_nodes,
         use_ilp=args.use_ilp,
         ilp_edge_weight=args.ilp_edge_weight,
         ilp_appearance_weight=args.ilp_appearance_weight,
@@ -786,6 +896,8 @@ def main() -> None:
             unet_batch_size=args.unet_batch_size,
             video_slice=video_slice,
             evaluate=args.evaluate,
+            log_csv=args.log_csv,
+            run_name=args.run_name,
         )
 
 
