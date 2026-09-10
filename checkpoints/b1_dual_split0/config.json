@@ -1,0 +1,19 @@
+{
+  "unet_out_channels": 32,
+  "unet_layers": [
+    32,
+    64,
+    128
+  ],
+  "downsample": [
+    1,
+    4,
+    4
+  ],
+  "window_size": 2,
+  "pool_kernel_um": 5.0,
+  "edge_loss": "dual",
+  "edge_activation": "dual_softmax_null",
+  "null_logit": 0.0,
+  "gate_um": null
+}
