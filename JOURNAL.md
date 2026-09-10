@@ -72,3 +72,42 @@ baseline for the Biohub cell-tracking competition. Newest entries at the bottom.
 - **Program order:** (1) train to convergence = real baseline; (2) detection
   resolution `1,2,2` vs `1,4,4`; (3) lock detection recipe (threshold/pool/aug);
   (4) linking (ILP + gap recovery); (5) 5-fold ensemble + TTA. Divisions last.
+
+---
+
+## 2026-09-09 · Session 3 — Kaggle CLI hookup + first convergence run launched
+
+- **Kaggle API hookup working.** Drive Kaggle from the local machine via the CLI.
+  Auth uses the new-style `KGAT_` token through the `KAGGLE_API_TOKEN` env var
+  (read from `~/.kaggle/kaggle.json` on each call, never printed) — the legacy
+  `{username,key}` kaggle.json path doesn't accept the KGAT token. Fixed the token
+  file (was UTF-16 with a bare token, now clean UTF-8 JSON). Kernel:
+  `michaelangel23/notebookce6b79f8c0` (GPU single T4, internet on, competition data
+  attached). Loop = edit notebook locally -> `kaggle kernels push` (runs headless,
+  persists output) -> poll status -> pull log/outputs.
+- **Notebook cells 5-8 fixed for real runs:** `--method baseline` (upstream default
+  is `unet_transformer`, which mismatched the `WEIGHTS`/predict/submission paths),
+  a `cd /kaggle/working/repo &&` prefix on every `!python` cell (cwd was drifting),
+  and an absolute `WEIGHTS` path.
+- **Launched baseline convergence run** (upstream, no PU): `--method baseline
+  --epochs 6 --max-iters 4000 --batch-size 1 --num-workers 4` = 24k iters (~1.4
+  passes), ~5 h on the T4. Full pipeline in one commit: setup -> data -> cv_split
+  -> train -> val CV (Cell 6) -> test predict -> submission.csv. Status: RUNNING.
+- **Calibration from the shakedown:** ~1.5 it/s; per-epoch eval = 282 s (more than a
+  300-iter train epoch) -> favor fewer epochs, larger `--max-iters`. Session storage
+  is ephemeral; only committed runs persist `/kaggle/working`.
+- **Next:** pull the log for per-epoch `test_recall` (convergence signal) and the
+  Cell 6 CV score (edge Jaccard / node_recall = the real number); confirm
+  `submission.csv` wrote. Then decide resolution `1,2,2` A/B.
+- **Built (untested): count-calibrated detection.** `predict_unet_transformer.py`
+  gains `--target-nodes N` and `--target-nodes-from-geff`. Instead of relying on a
+  global probability threshold, it keeps the top-K most confident peaks per frame
+  with `K = N/T`, so the video's total node count lands near N. This attacks the
+  score's `(1 - 0.1*(N_pred - N_true)/N_true)` penalty *directly* rather than hoping
+  a threshold happens to land there. Costs one inference pass (no retraining), so it
+  A/Bs against the existing checkpoint almost free — highest expected value per
+  GPU-hour on the board.
+  **Open gap:** validate on val videos first (their `.geff` carries
+  `estimated_number_of_nodes`); **test videos have no `.geff`**, so a per-video
+  estimator of `N_true` is still required — fit it from `eda.csv` (N_true vs image
+  dims / T / frame count), which arrives with the current run's output.

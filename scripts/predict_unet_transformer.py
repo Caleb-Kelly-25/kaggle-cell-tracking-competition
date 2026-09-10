@@ -68,6 +68,11 @@ class PredictConfig:
     det_threshold: float = 0.5
     det_tta: bool = True  # flip-xy TTA for detection logits
     pool_kernel_um: float = 3.0  # max-pool kernel size in µm for detection peak extraction
+    # Count calibration.  The score is scaled by (1 - 0.1*(N_pred - N_true)/N_true),
+    # so aiming the *count* at N_true optimises the objective directly instead of
+    # hoping a global probability threshold happens to land there.
+    target_nodes: int | None = None        # total nodes to aim for across the video
+    target_nodes_from_geff: bool = False   # read estimated_number_of_nodes from the .geff
     # Edge filtering
     edge_activation: str = "softmax"  # "sigmoid" or "softmax"
     threshold: float = 0.5
@@ -251,11 +256,25 @@ def pool_kernel_from_um(
     return tuple(kernel)
 
 
+def _read_estimated_nodes(ds_path: Path) -> float | None:
+    """Read ``estimated_number_of_nodes`` from the dataset's ``.geff`` (None if absent)."""
+    geff_path = ds_path.parent / f"{ds_path.stem}.geff"
+    if not geff_path.exists():
+        return None
+    try:
+        from geff import GeffMetadata
+        val = (GeffMetadata.read(geff_path).extra or {}).get("estimated_number_of_nodes")
+        return float(val) if val is not None else None
+    except Exception:
+        return None
+
+
 def _detect_cells_pooled(
     det_logits: torch.Tensor,
     t: int,
     det_threshold: float = 0.5,
     pool_kernel: tuple[int, ...] = (3, 3, 3),
+    top_k: int | None = None,
 ) -> np.ndarray:
     """Extract cell coordinates via max-pool local-max (same as training).
 
@@ -287,6 +306,12 @@ def _detect_cells_pooled(
 
     if peak_idx.shape[0] == 0:
         return np.empty((0, 4), dtype=np.int16)
+
+    # Count calibration: keep only the *top_k* most confident peaks in this frame.
+    if top_k is not None and peak_idx.shape[0] > top_k:
+        scores = logits[0, 0][peak_idx[:, 0], peak_idx[:, 1], peak_idx[:, 2]]
+        keep = torch.topk(scores, top_k).indices
+        peak_idx = peak_idx[keep]
 
     coords = peak_idx.float().cpu().numpy()
     t_col = np.full((len(coords), 1), t, dtype=np.float32)
@@ -333,6 +358,19 @@ def predict_video(
     W = window_size
     voxel_size = tuple(s * d for s, d in zip(ds.scale, downsample))
     pool_k = pool_kernel_from_um(cfg.pool_kernel_um, voxel_size)
+
+    # Count calibration: convert a per-video node target into a per-frame quota.
+    target_total = cfg.target_nodes
+    if cfg.target_nodes_from_geff:
+        target_total = _read_estimated_nodes(ds_path) or target_total
+    top_k_per_frame = None
+    if target_total:
+        top_k_per_frame = max(1, int(round(float(target_total) / max(T, 1))))
+        print(
+            f"  count calibration: target {int(target_total)} nodes over {T} frames "
+            f"-> top-{top_k_per_frame} peaks/frame",
+            flush=True,
+        )
 
     # Running node registry — each entry records the frame-t detections.
     # coord_offset[t] = (start, end) half-open range into the stacked array.
@@ -394,6 +432,7 @@ def predict_video(
             if t not in seen_frames:
                 arr = _detect_cells_pooled(
                     det_logits[f_idx][0], t, cfg.det_threshold, pool_k,
+                    top_k=top_k_per_frame,
                 )
                 coord_offset[t] = (global_node_count, global_node_count + len(arr))
                 global_node_count += len(arr)
@@ -620,6 +659,13 @@ def main() -> None:
                              "Default 0.99: the detector is poorly calibrated because the "
                              "ground truth is sparse (only some cells annotated), so a high "
                              "threshold keeps precision up. Sweep it for your model.")
+    parser.add_argument("--target-nodes", type=int, default=None,
+                        help="Cap detections so the video's total node count lands near N "
+                             "(per-frame quota = N/T, keeping the most confident peaks). "
+                             "Targets the metric's node-count penalty directly.")
+    parser.add_argument("--target-nodes-from-geff", action="store_true",
+                        help="Read the per-video target from estimated_number_of_nodes in the "
+                             "dataset's .geff (train/val only -- test videos have no .geff).")
     parser.add_argument("--use-ilp", action="store_true",
                         help="Post-process the predicted graph with the tracksdata ILP "
                              "solver (global, flow-consistent linking) instead of greedy "
@@ -645,6 +691,8 @@ def main() -> None:
     )
     cfg = PredictConfig(
         det_threshold=args.det_threshold,
+        target_nodes=args.target_nodes,
+        target_nodes_from_geff=args.target_nodes_from_geff,
         use_ilp=args.use_ilp,
         ilp_edge_weight=args.ilp_edge_weight,
         ilp_appearance_weight=args.ilp_appearance_weight,
