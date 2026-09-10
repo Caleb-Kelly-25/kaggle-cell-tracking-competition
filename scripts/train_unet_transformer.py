@@ -33,6 +33,7 @@ from tracking_cellmot.io import invert_time_graph, open_dataset
 from tracking_cellmot.linking import (
     GATE_FILL,
     distance_gate,
+    edge_probs,
     focal_bce_from_logits,
     focal_bce_from_logp,
     null_log_softmax,
@@ -170,18 +171,44 @@ def compute_batch_loss(
 def _evaluate_pair(
     logits: torch.Tensor,
     target: torch.Tensor,
+    *,
+    gate: torch.Tensor | None = None,
+    mode: str = "colsoftmax",
+    activation: str = "softmax",
+    sigmoid_weight: float = 0.0,
+    focal_gamma: float = 2.0,
+    null_logit: float = 0.0,
 ) -> tuple[float, int, int]:
-    """Per-pair evaluation. Returns (loss, correct, total)."""
+    """Per-pair held-out evaluation. Returns (loss, correct, total).
+
+    The loss must be computed under the **arm's own objective**. This
+    previously always used the legacy column softmax, so an arm trained with a
+    null slot was scored by a likelihood it never optimised -- which still
+    ranks epochs consistently *within* a run, but makes `--model-select loss`
+    meaningless *across* arms. The defaults are the legacy path exactly
+    (``edge_probs(x, "softmax")`` is ``torch.softmax(x, dim=0)``).
+    """
     active_rows = target.sum(dim=1) > 0
     active_cols = target.sum(dim=0) > 0
     if not active_rows.any():
         return 0.0, 0, 0
 
-    loss = compute_loss(logits, target).item()
-    probs = torch.softmax(logits, dim=0)
-    preds = (probs > 0.5).float()
+    loss = compute_loss(
+        logits, target, mode=mode, gate=gate,
+        sigmoid_weight=sigmoid_weight, focal_gamma=focal_gamma,
+        null_logit=null_logit,
+    ).item()
 
     mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
+    if gate is not None:
+        # Mirror compute_loss: gated pairs are excluded, not merely down-weighted.
+        logits = logits.masked_fill(~gate, GATE_FILL)
+        mask = mask & gate
+    if not mask.any():
+        return loss, 0, 0
+
+    probs = edge_probs(logits, activation, null_logit)
+    preds = (probs > 0.5).float()
     correct = (preds[mask] == target[mask]).sum().item()
     total = mask.sum().item()
 
@@ -1083,8 +1110,19 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     pool_kernel_um: float = 5.0,
+    *,
+    edge_loss_mode: str = "colsoftmax",
+    edge_activation: str = "softmax",
+    edge_sigmoid_weight: float = 0.0,
+    edge_focal_gamma: float = 2.0,
+    edge_null_logit: float = 0.0,
+    train_gate_um: float = float("inf"),
 ) -> tuple[float, float, float]:
     """Evaluate model using detect→match→predict (same path as training).
+
+    The edge_* arguments must match what the arm trained with, so the held-out
+    loss is the arm's own objective; see `_evaluate_pair`. Defaults are the
+    legacy path.
 
     Returns (avg_loss, accuracy, node_recall).
     """
@@ -1145,11 +1183,26 @@ def evaluate(
                 voxel_size=orig_voxel_size,
             )
 
+            # Same gate the training loss uses, so the held-out number is
+            # comparable to the one being minimised.
+            pair_gate = None
+            if np.isfinite(train_gate_um):
+                pair_gate = distance_gate(
+                    pair_distance_um(frame_det[i][0], frame_det[i + 1][0], voxel_size),
+                    train_gate_um,
+                )
+
             for b in range(B):
                 ns_b = int(frame_det[i][2][b].sum().item())
                 nt_b = int(frame_det[i + 1][2][b].sum().item())
                 pair_loss, pair_correct, pair_total = _evaluate_pair(
                     pair_logits[b, :ns_b, :nt_b], pair_target[b, :ns_b, :nt_b],
+                    gate=None if pair_gate is None else pair_gate[b, :ns_b, :nt_b],
+                    mode=edge_loss_mode,
+                    activation=edge_activation,
+                    sigmoid_weight=edge_sigmoid_weight,
+                    focal_gamma=edge_focal_gamma,
+                    null_logit=edge_null_logit,
                 )
                 total_loss += pair_loss
                 correct += pair_correct
@@ -1416,7 +1469,18 @@ def train(
         train_time = time.monotonic() - t0
 
         t0 = time.monotonic()
-        test_loss, test_acc, test_recall = evaluate(model, test_loader, device, pool_kernel_um=pool_kernel_um)
+        test_loss, test_acc, test_recall = evaluate(
+            model, test_loader, device, pool_kernel_um=pool_kernel_um,
+            # Score the held-out set under THIS arm's objective, not a fixed
+            # legacy softmax -- otherwise --model-select loss is not comparable
+            # between arms that optimise different likelihoods.
+            edge_loss_mode=edge_loss_mode,
+            edge_activation=_INFERENCE_ACTIVATION[edge_loss_mode],
+            edge_sigmoid_weight=edge_sigmoid_weight,
+            edge_focal_gamma=edge_focal_gamma,
+            edge_null_logit=edge_null_logit,
+            train_gate_um=train_gate_um,
+        )
         test_time = time.monotonic() - t0
 
         # `test_acc` carries almost no linking signal: the supervised mask is

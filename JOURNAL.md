@@ -404,3 +404,35 @@ The Kaggle API token in `~/.kaggle/kaggle.json` (user `michaelangel23`) is being
 rejected — `kernels.get` denied on the correct slug, and `kernels list --mine`
 reports "Authentication required". Cannot reach `cellmot-retrain-arms` or pull
 B0/B1 results until a new token is generated at kaggle.com/settings/api.
+
+## 2026-09-10 (cont.) — Kaggle auth fixed; held-out loss now uses the arm's objective
+
+### The Kaggle token was in the wrong field, not expired
+`kaggle.json` held a **new-style `KGAT...` token** in the legacy `key` field, so
+the CLI reported `auth_method: LEGACY_API_KEY` and sent it the old way — which
+surfaces as *"Permission 'kernels.get' was denied ... most likely a wrong slug"*
+on a kernel call and *"Authentication required"* on a list call. Neither message
+points at the real cause. Fix: the same token in `~/.kaggle/access_token` (or
+`KAGGLE_API_TOKEN`), which authenticates immediately. `kaggle.json` left intact.
+CLI 2.2.4 at `AppData\Roaming\Python\Python314\Scripts\kaggle.exe` (not on PATH).
+
+`cellmot-retrain-arms` is RUNNING, ~4h20m elapsed, no artifacts yet — Kaggle
+exposes outputs only on commit, so there is no mid-run progress to read.
+
+### Fixed: `--model-select loss` was not comparable across arms
+`_evaluate_pair` called `compute_loss(logits, target)` with bare defaults, so
+every arm's held-out loss was scored under the **legacy column softmax**
+regardless of what it trained on. An arm trained with a null slot was being
+judged by a likelihood it never optimised. That still ranks epochs consistently
+*within* a run, but makes the number meaningless *between* runs — exactly the
+comparison Phase 2 depends on.
+
+`_evaluate_pair` and `evaluate()` now take the arm's `mode`/`activation`/
+`gamma`/`null_logit` and the same distance gate the training loss uses;
+`train()` passes `_INFERENCE_ACTIVATION[edge_loss_mode]`. Verified: defaults are
+**bit-identical** to a frozen copy of the old body over 10 seeds, and the four
+modes now produce four distinct held-out losses (they were identical before).
+Scope-checked `_INFERENCE_ACTIVATION` by AST — assigned at :1300, loaded at
+:1313 and :1478 — since a NameError here would only appear hours into a run.
+
+111 unit tests passing.

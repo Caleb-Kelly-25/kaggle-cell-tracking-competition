@@ -158,3 +158,71 @@ def test_division_row_weight_is_a_no_op() -> None:
     assert (target.sum(dim=1) > 1).any(), "test setup must contain a division"
     assert torch.equal(train.compute_loss(logits, target),
                        _legacy_compute_loss(logits, target))
+
+
+# ---------------------------------------------------------------------------
+# Held-out evaluation must use the arm's own objective
+# ---------------------------------------------------------------------------
+
+def _legacy_evaluate_pair(logits, target):
+    """Frozen copy of the pre-fix body, for bit-identity of the defaults."""
+    active_rows = target.sum(dim=1) > 0
+    active_cols = target.sum(dim=0) > 0
+    if not active_rows.any():
+        return 0.0, 0, 0
+    loss = train.compute_loss(logits, target).item()
+    probs = torch.softmax(logits, dim=0)
+    preds = (probs > 0.5).float()
+    mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
+    return loss, (preds[mask] == target[mask]).sum().item(), mask.sum().item()
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_evaluate_pair_defaults_are_bit_identical_to_legacy(seed: int) -> None:
+    g = torch.Generator().manual_seed(seed)
+    logits = torch.randn(9, 7, generator=g) * 3
+    target = (torch.rand(9, 7, generator=g) > 0.85).float()
+    got = train._evaluate_pair(logits, target)
+    want = _legacy_evaluate_pair(logits, target)
+    assert got[1:] == want[1:]
+    assert got[0] == want[0], (got[0], want[0])
+
+
+def test_evaluate_pair_actually_changes_with_the_arm_objective() -> None:
+    """The bug: the held-out loss ignored `mode`, so every arm got the same number.
+
+    A null-slot arm scored under the legacy column softmax is being judged by a
+    likelihood it never optimised, which makes --model-select loss incomparable
+    across arms. These must differ.
+    """
+    g = torch.Generator().manual_seed(0)
+    logits = torch.randn(12, 10, generator=g) * 3
+    target = (torch.rand(12, 10, generator=g) > 0.85).float()
+    losses = {
+        m: train._evaluate_pair(logits, target, mode=m)[0]
+        for m in ("colsoftmax", "parental", "dual", "sigmoid")
+    }
+    assert len(set(losses.values())) == len(losses), losses
+    assert all(x == x and abs(x) != float("inf") for x in losses.values()), losses
+
+
+def test_evaluate_forwards_the_objective_to_evaluate_pair() -> None:
+    """A parameter that stops at `evaluate()` would silently restore the bug."""
+    import inspect
+    sig = inspect.signature(train.evaluate).parameters
+    for name in ("edge_loss_mode", "edge_activation", "edge_sigmoid_weight",
+                 "edge_focal_gamma", "edge_null_logit", "train_gate_um"):
+        assert name in sig, f"evaluate() does not accept {name}"
+    body = inspect.getsource(train.evaluate)
+    for name in ("mode=edge_loss_mode", "activation=edge_activation",
+                 "null_logit=edge_null_logit"):
+        assert name in body, f"evaluate() never forwards {name} to _evaluate_pair"
+
+
+def test_train_scores_the_heldout_set_under_its_own_activation() -> None:
+    """`train()` must pass the arm's inference activation, not the default."""
+    import inspect
+    body = inspect.getsource(train.train)
+    assert "edge_activation=_INFERENCE_ACTIVATION[edge_loss_mode]" in body, (
+        "train() calls evaluate() without mapping its loss mode to an activation"
+    )
