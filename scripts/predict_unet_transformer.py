@@ -82,8 +82,14 @@ class PredictConfig:
     # pays the node-count penalty; 2 drops isolated nodes (strictly beneficial).
     min_track_nodes: int = 2
     # Edge filtering
-    edge_activation: str = "softmax"  # "sigmoid" or "softmax"
+    edge_activation: str = "softmax"  # see _edge_probs for the full set
     threshold: float = 0.5
+    # Candidate gating.  Median true inter-frame displacement is ~1.8 um (p90 3.6),
+    # so a gate of ~10-15 um keeps essentially every real edge while removing
+    # implausible candidates -- and, because the softmax is normalised over SOURCE
+    # nodes, it stops distant nodes from stealing probability mass.
+    gate_um: float = float("inf")     # inf = no gate (legacy behaviour)
+    null_logit: float = 0.0           # only used by the "*_null" activations
 
     # ILP post-processing
     use_ilp: bool = False
@@ -271,6 +277,45 @@ def _append_results_csv(path: Path, row: dict) -> None:
         if is_new:
             writer.writeheader()
         writer.writerow(row)
+
+
+def _edge_probs(
+    raw: torch.Tensor,
+    activation: str = "softmax",
+    null_logit: float = 0.0,
+) -> torch.Tensor:
+    """Convert raw pair logits ``(n_src, n_tgt)`` into edge probabilities.
+
+    ``softmax`` (legacy) normalises down each *column*, so every target at t+1
+    spreads exactly one unit of probability across candidate parents at t. That
+    forces every child to take a parent, which is the structural reason this
+    model over-predicts divisions: a child whose real parent was never detected
+    still hands its full unit of mass to some neighbouring node, creating a fork.
+
+    ``*_null`` adds a null logit to the denominator so a detection may have NO
+    parent -- Trackastra's "parental softmax", ``exp(a) / (exp(b) + sum exp(a))``.
+    That is exactly ``col_softmax * sigmoid(logsumexp - null_logit)``.
+
+    ``dual_*`` multiplies the column term by the row term, penalising a parent
+    that is splitting its own mass across several children -- i.e. it regulates
+    out-degree, which the column softmax never did.
+    """
+    if activation == "sigmoid":
+        return torch.sigmoid(raw)
+
+    use_null = activation.endswith("_null")
+    col = torch.softmax(raw, dim=0)
+    if use_null:
+        col = col * torch.sigmoid(torch.logsumexp(raw, dim=0, keepdim=True) - null_logit)
+
+    if activation in ("softmax", "softmax_null"):
+        return col
+    if activation in ("dual_softmax", "dual_softmax_null"):
+        row = torch.softmax(raw, dim=1)
+        if use_null:
+            row = row * torch.sigmoid(torch.logsumexp(raw, dim=1, keepdim=True) - null_logit)
+        return torch.sqrt(col * row)
+    raise ValueError(f"Unknown edge_activation: {activation!r}")
 
 
 # =============================================================================
@@ -612,20 +657,30 @@ def predict_video(
             )  # (1, n_src, n_tgt)
 
             raw = edge_logits_pair[0]
-            if cfg.edge_activation == "softmax":
-                probs = torch.softmax(raw, dim=0).cpu().numpy()
-            else:
-                probs = torch.sigmoid(raw).cpu().numpy()
 
-            candidates = sorted(
-                [
-                    (probs[i, j], i, j)
-                    for i in range(n_src)
-                    for j in range(n_tgt)
-                    if probs[i, j] > cfg.threshold
-                ],
-                reverse=True,
-            )
+            # Physical (um) distance between every candidate pair, for gating.
+            cs = coords_so_far[idx_src, 1:].astype(np.float32)
+            ct = coords_so_far[idx_tgt, 1:].astype(np.float32)
+            vs_np = np.asarray(voxel_size, dtype=np.float32)
+            d_um = np.linalg.norm((cs[:, None, :] - ct[None, :, :]) * vs_np, axis=-1)
+
+            gate_np = None
+            if np.isfinite(cfg.gate_um):
+                gate_np = d_um <= cfg.gate_um
+                raw = raw.masked_fill(
+                    torch.from_numpy(~gate_np).to(raw.device), -1e4,
+                )
+
+            probs = _edge_probs(raw, cfg.edge_activation, cfg.null_logit).cpu().numpy()
+            if gate_np is not None:
+                # Zero gated pairs outright: a fully-masked column would otherwise
+                # renormalise to a uniform (and possibly supra-threshold) value.
+                probs = np.where(gate_np, probs, 0.0)
+
+            sel = np.argwhere(probs > cfg.threshold)
+            if sel.size:
+                sel = sel[np.argsort(-probs[sel[:, 0], sel[:, 1]])]
+            candidates = [(float(probs[i, j]), int(i), int(j)) for i, j in sel]
 
             children_count: dict[int, int] = {}
             parents_count: dict[int, int] = {}
@@ -779,6 +834,13 @@ def predict(
                 "max_out_degree": cfg.max_out_degree,
                 "max_in_degree": cfg.max_in_degree,
                 "min_track_nodes": cfg.min_track_nodes,
+                "edge_activation": cfg.edge_activation,
+                "threshold": cfg.threshold,
+                "gate_um": cfg.gate_um,
+                "null_logit": cfg.null_logit,
+                "max_children_per_node": cfg.max_children_per_node,
+                "max_parents_per_node": cfg.max_parents_per_node,
+                "det_tta": cfg.det_tta,
                 "use_ilp": cfg.use_ilp,
                 "weights": str(weights_path),
             })
@@ -832,6 +894,23 @@ def main() -> None:
     parser.add_argument("--max-in-degree", type=int, default=1,
                         help="Keep at most N incoming edges per node (default 1; merges are "
                              "biologically invalid and score as false positives). 0 disables.")
+    parser.add_argument("--edge-activation", type=str, default="softmax",
+                        choices=["softmax", "sigmoid", "softmax_null",
+                                 "dual_softmax", "dual_softmax_null"],
+                        help="How pair logits become edge probabilities. 'softmax' (legacy) "
+                             "forces every child to take a parent; '*_null' allows no parent; "
+                             "'dual_*' also penalises a parent splitting mass across children.")
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="Minimum edge probability to emit an edge (default 0.5).")
+    parser.add_argument("--gate-um", type=float, default=float("inf"),
+                        help="Discard candidate links longer than N microns before scoring "
+                             "(default inf = no gate). Median true displacement is ~1.8 um.")
+    parser.add_argument("--null-logit", type=float, default=0.0,
+                        help="Null-parent logit for the '*_null' activations (default 0.0).")
+    parser.add_argument("--max-children-per-node", type=int, default=None,
+                        help="Greedy cap on outgoing edges per node (default 2; 1 = no divisions).")
+    parser.add_argument("--max-parents-per-node", type=int, default=None,
+                        help="Greedy cap on incoming edges per node (default 1).")
     parser.add_argument("--min-track-nodes", type=int, default=2,
                         help="Drop nodes in track fragments smaller than N (default 2 = drop "
                              "isolated nodes, which can never score an edge but still pay the "
@@ -876,6 +955,12 @@ def main() -> None:
         max_in_degree=args.max_in_degree,
         min_track_nodes=args.min_track_nodes,
         det_tta=args.det_tta,
+        edge_activation=args.edge_activation,
+        threshold=args.threshold,
+        gate_um=args.gate_um,
+        null_logit=args.null_logit,
+        max_children_per_node=args.max_children_per_node,
+        max_parents_per_node=args.max_parents_per_node,
         use_ilp=args.use_ilp,
         ilp_edge_weight=args.ilp_edge_weight,
         ilp_appearance_weight=args.ilp_appearance_weight,
