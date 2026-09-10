@@ -73,6 +73,11 @@ class PredictConfig:
     # hoping a global probability threshold happens to land there.
     target_nodes: int | None = None        # total nodes to aim for across the video
     target_nodes_from_geff: bool = False   # read estimated_number_of_nodes from the .geff
+    # Edge pruning.  The scorer keeps only consecutive-frame edges and caps
+    # out-degree at 2 by *arbitrary* edge id; pruning ourselves by probability
+    # means our best links are the ones that survive.  0 disables a cap.
+    max_out_degree: int = 2                # <=2 children (a division)
+    max_in_degree: int = 1                 # <=1 parent (merges are invalid)
     # Edge filtering
     edge_activation: str = "softmax"  # "sigmoid" or "softmax"
     threshold: float = 0.5
@@ -150,6 +155,54 @@ def build_graph(
         ])
 
     return graph
+
+
+def prune_edges(
+    coords: np.ndarray,
+    edges: list[tuple[int, int, float, float]],
+    max_out_degree: int = 2,
+    max_in_degree: int = 1,
+) -> list[tuple[int, int, float, float]]:
+    """Drop edges the scorer discards, choosing survivors by predicted probability.
+
+    The metric (a) keeps only edges with ``t_target == t_source + 1`` — backward
+    and gap-spanning edges are thrown away — and (b) caps out-degree at 2 keeping
+    the two *lowest edge ids*, an arbitrary tiebreak that can discard our best
+    link.  Extra incoming edges are biologically impossible merges and score as
+    false positives.  Pruning here, highest probability first, means we choose
+    which edges survive instead of letting insertion order choose for us.
+
+    A degree limit of ``0`` disables that cap (used when the ILP solver runs,
+    since it enforces its own flow constraints).
+    """
+    if not edges:
+        return edges
+
+    t = coords[:, 0].astype(np.int64)
+
+    # Consecutive frames only — everything else is discarded by the scorer.
+    kept = [e for e in edges if t[e[1]] - t[e[0]] == 1]
+
+    # Highest probability first, so each cap keeps the most confident links.
+    kept.sort(key=lambda e: e[2], reverse=True)
+
+    out_count: dict[int, int] = {}
+    in_count: dict[int, int] = {}
+    pruned: list[tuple[int, int, float, float]] = []
+    for src, tgt, prob, dist in kept:
+        if max_out_degree and out_count.get(src, 0) >= max_out_degree:
+            continue
+        if max_in_degree and in_count.get(tgt, 0) >= max_in_degree:
+            continue
+        out_count[src] = out_count.get(src, 0) + 1
+        in_count[tgt] = in_count.get(tgt, 0) + 1
+        pruned.append((src, tgt, prob, dist))
+
+    n_dropped = len(edges) - len(pruned)
+    if n_dropped:
+        print(f"  pruned {n_dropped}/{len(edges)} edges "
+              f"(non-consecutive / degree caps)", flush=True)
+    return pruned
 
 
 # =============================================================================
@@ -590,6 +643,12 @@ def predict(
                 unet_batch_size=unet_batch_size,
                 downsample=downsample,
             )
+        edges = prune_edges(
+            coords, edges,
+            # The ILP enforces its own flow constraints, so only pre-filter for it.
+            max_out_degree=0 if cfg.use_ilp else cfg.max_out_degree,
+            max_in_degree=0 if cfg.use_ilp else cfg.max_in_degree,
+        )
         graph = build_graph(coords, edges)
         if cfg.use_ilp and graph.num_edges() > 0:
             solver = td.solvers.ILPSolver(
@@ -666,6 +725,13 @@ def main() -> None:
     parser.add_argument("--target-nodes-from-geff", action="store_true",
                         help="Read the per-video target from estimated_number_of_nodes in the "
                              "dataset's .geff (train/val only -- test videos have no .geff).")
+    parser.add_argument("--max-out-degree", type=int, default=2,
+                        help="Keep at most N outgoing edges per node, highest probability first "
+                             "(default 2 = a division). The scorer caps out-degree at 2 by "
+                             "arbitrary edge id, so pruning here keeps our best links. 0 disables.")
+    parser.add_argument("--max-in-degree", type=int, default=1,
+                        help="Keep at most N incoming edges per node (default 1; merges are "
+                             "biologically invalid and score as false positives). 0 disables.")
     parser.add_argument("--use-ilp", action="store_true",
                         help="Post-process the predicted graph with the tracksdata ILP "
                              "solver (global, flow-consistent linking) instead of greedy "
@@ -693,6 +759,8 @@ def main() -> None:
         det_threshold=args.det_threshold,
         target_nodes=args.target_nodes,
         target_nodes_from_geff=args.target_nodes_from_geff,
+        max_out_degree=args.max_out_degree,
+        max_in_degree=args.max_in_degree,
         use_ilp=args.use_ilp,
         ilp_edge_weight=args.ilp_edge_weight,
         ilp_appearance_weight=args.ilp_appearance_weight,

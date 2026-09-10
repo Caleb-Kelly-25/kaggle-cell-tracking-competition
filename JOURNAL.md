@@ -144,3 +144,12 @@ baseline for the Biohub cell-tracking competition. Newest entries at the bottom.
 
 - **Unchanged:** edge Jaccard and the `(1 - 0.1*(N_pred - N_true)/N_true)` node
   penalty. Count calibration remains the highest-ROI item.
+- **Built + unit-tested: `prune_edges`** (`--max-out-degree`, default 2;
+  `--max-in-degree`, default 1). Drops non-consecutive edges and enforces the
+  degree caps **by predicted probability**, so our best links survive instead of
+  the scorer's arbitrary lowest-edge-id tiebreak. Skipped under `--use-ilp` (the
+  solver enforces its own flow constraints). Verified locally against the real
+  source with 4 cases (non-consecutive drop, out-degree top-2, in-degree top-1,
+  caps disabled) — the only change so far actually *executed*, not just
+  syntax-checked. Inference-only, so it stacks with count calibration at no
+  training cost.
