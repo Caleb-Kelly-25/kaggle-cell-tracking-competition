@@ -111,3 +111,36 @@ baseline for the Biohub cell-tracking competition. Newest entries at the bottom.
   `estimated_number_of_nodes`); **test videos have no `.geff`**, so a per-video
   estimator of `N_true` is still required — fit it from `eda.csv` (N_true vs image
   dims / T / frame count), which arrives with the current run's output.
+
+---
+
+## 2026-09-09 · Session 3b — fork live + UPSTREAM METRIC CHANGED (important)
+
+- **Fork live.** `Caleb-Kelly-25/kaggle-cell-tracking-competition`, `main` = our work
+  rebased onto upstream. Notebook Cell 1 `REPO_URL` now points at the fork, so Kaggle
+  runs get PU + count calibration. (Needs a *fresh* Kaggle session to re-clone.)
+- **Upstream moved and it matters.** Rebased onto `075fc5f` ("patch weakly connected
+  component exploit"). Our local base was stale; a force-push would have run the OLD
+  metric locally while the leaderboard used the new one. Rebase was clean (we touch
+  `scripts/`, they touched `src/tracking_cellmot/metrics*` + tests).
+
+### Metric changes — three exploits patched (rewrites parts of our plan)
+1. **Consecutive-frame edges only.** `_evaluate_matched_graph` now filters to
+   `t_target - t_source == 1`; backward and gap-spanning edges are DISCARDED.
+   => Skip-frame "gap recovery" edges score nothing. Gap recovery is only worth
+   anything if it **inserts a node** at the missing timepoint.
+2. **Merge collapsing.** Several predicted nodes matching one GT node can no longer
+   each claim the same GT edge (lowest edge id kept). => Duplicate/over-detection
+   near a cell buys no TP and still pays the node-count penalty: purely harmful.
+   Tighten NMS (`--pool-kernel-um`) and rely on count calibration.
+3. **Out-degree capped at 2**, keeping the two **lowest edge ids** (arbitrary).
+   => Emitting >2 outgoing edges risks losing the *best* edge to an arbitrary
+   tiebreak. **Action: prune out-degree to <=2 ourselves, keeping the two highest
+   -probability edges.** Cheap, free win.
+4. **Division metric is now local** (`grandparent -> parent -> children ->
+   grandchildren`), no graph-wide reachability; fork must be a matched parent-side
+   node or its immediate successor, with two distinct daughter branches.
+   => Divisions are strictly harder now and still only 0.1 weight: deprioritize further.
+
+- **Unchanged:** edge Jaccard and the `(1 - 0.1*(N_pred - N_true)/N_true)` node
+  penalty. Count calibration remains the highest-ROI item.
