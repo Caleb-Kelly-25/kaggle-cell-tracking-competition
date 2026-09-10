@@ -287,3 +287,69 @@ gate**, so the softmax normalised over nodes 100+ um away.
    checkpoint into the repo works and is simpler.
 5. `kaggle kernels output` is slow — don't wrap it in a short `timeout` or it
    truncates before reaching alphabetically-late files.
+
+---
+
+## 2026-09-10 · Session 5 — inference sweep round 2 + Tier-A retrain implemented
+
+### Round-2 sweep: 0.6688 (inference-only, no retraining)
+
+| run | score | edge_J | node_rec |
+|---|---|---|---|
+| **r2_nofork_g9_dual** | **0.6688** | 0.6797 | 0.9413 |
+| r2_nofork_dual_g12 | 0.6681 | 0.6779 | 0.9380 |
+| r2_nofork_gate12 (anchor) | 0.6561 | 0.6649 | 0.9368 |
+| r2_nofork_g12_det0.90 | 0.6491 | 0.6669 | 0.9489 |
+
+The repeated `nofork_gate12` anchor reproduced round 1 **exactly**, so the sweep is
+deterministic. Best inference recipe: `--max-children-per-node 1 --gate-um 9
+--edge-activation dual_softmax`. **0.6016 -> 0.6688 = +11.2%, zero GPU training.**
+Lowering `--det-threshold` *hurt* despite raising node_recall — more detections buy
+FPs and node-count penalty, not TPs.
+
+### Ablation correction (important)
+Decomposing round 1: pruning **+0.0198**, `--max-children-per-node 1` **+0.0411**,
+12um gate **-0.0064**. The earlier claim that "the gate won" was wrong; suppressing
+forks is what won. `dual_softmax` then adds ~+0.012 on top, which independently
+supports the `dual` training arm.
+
+### Tier-A implemented (items 1,3,4,5; item 2 deferred as a rewrite)
+- `src/tracking_cellmot/linking.py` (new): `null_log_softmax`, `edge_probs`, focal
+  BCE helpers, `pair_distance_um`, `distance_gate`. `predict` now imports
+  `edge_probs` from here instead of keeping a second copy.
+- `compute_loss(mode=...)`: `colsoftmax` (legacy, bit-identical), `parental`
+  (Trackastra null slot), **`dual`** (null slots on BOTH axes -> regulates
+  out-degree, our actual failure mode), `sigmoid`. Optional distance gate.
+- `--init-from`, `--freeze-unet`, `--seed`, `--model-select`.
+- **69 local unit tests** with real torch and no data (torch 2.11.0+cpu IS
+  installed locally; `tests/conftest.py` now stubs absent deps and adds src/).
+
+### Two real bugs caught before they cost a run
+1. **`--det-loss-weight 0` does not freeze the UNet.** BatchNorm keeps using batch
+   statistics and updating running estimates regardless of `requires_grad`, so a
+   "frozen" UNet still drifts. Must call `.eval()` on unet + detect_head AFTER
+   `model.train()`. (Also means training previously used BN batch-stats while
+   inference used running stats — the linker never trained on the detections it
+   is scored on.)
+2. **A config parameter clobbered by a loop variable — twice.** Both `train()` and
+   `train_epoch()` assign `edge_loss`, so a parameter of that name held a *tensor*
+   after the first iteration. A GPU arm died with
+   `Unknown edge loss mode: tensor(0.0017, ...)`. Fixed by renaming to
+   `edge_loss_mode` in both, plus a static AST guard over config parameters —
+   **verified to fire when the bug is reintroduced**, since a signature test
+   cannot see a runtime rebinding.
+
+### Also confirmed
+- `test_acc` is degenerate (~99.9% negatives: a constant, an all-zero and a random
+  model score identically), so `acc*recall` collapses to `recall`, which is
+  CONSTANT under `--freeze-unet` and with `>=` saved every epoch. Hence
+  `--model-select loss`.
+- `torch.manual_seed` was never called: no run was ever reproducible.
+
+### Running
+`cellmot-retrain-arms`: B0 (`colsoftmax`, the fine-tuning confound control) and B1
+(`dual`), each fine-tuned from the vendored checkpoint with the UNet frozen, then
+scored under three activations.
+**Open caveat:** `_evaluate_pair` still computes the held-out loss with the legacy
+softmax, so `--model-select loss` ranks epochs consistently but not under the arm's
+own objective. Fine for picking an epoch within a run; not comparable across arms.
