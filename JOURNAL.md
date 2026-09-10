@@ -180,8 +180,15 @@ Rank by (expected gain per GPU-hour) x P(works), not novelty.
   `estimated_number_of_nodes` *gives* us the prior), track-consistency
   self-training, controlled annotation-sparsity sweep.
 
-### Parallel runs launched (matched A/B)
-- **Kaggle allows >=2 concurrent GPU kernels** on this account (confirmed empirically).
+### Parallel runs launched (matched A/B) — CORRECTED: parallel GPU does NOT work
+- **WRONG (retracted):** I claimed ">=2 concurrent GPU kernels confirmed" off a single
+  `RUNNING` status string. Run 2 then went to **ERROR**. Its output has
+  `weights/pu/split_0/config.json` but **no checkpoint**, i.e. training started and
+  died before one epoch — the `torch.cuda.synchronize()` no-GPU failure mode again.
+  Best inference (log came back 0 bytes, so unconfirmed): **a second concurrent job
+  gets a session with NO GPU** while run 1 holds the allocation. CPU-only cells (EDA,
+  cv_splits) completed fine; training died on first CUDA touch.
+  **Operational rule: run GPU jobs sequentially. Verify with artifacts, not status.**
 - `notebookce6b79f8c0` = **BCE control** (clones upstream).
 - `cellmot-pu-run2` = **PU arm** (clones the fork), `--method pu --detection-loss pu
   --pu-gate-power 2.0`, otherwise identical.
@@ -191,4 +198,41 @@ Rank by (expected gain per GPU-hour) x P(works), not novelty.
   making the A/B meaningless. Cells 7/8 stubbed (no test predict/submission needed).
 - Both log to `results.csv`. Cost ~10 GPU-h of the 30/week.
 - **Never push a new version to a kernel that is running** — it supersedes the job.
-  Parallel runs require a separate kernel id.
+  Parallel runs require a separate kernel id (but see above: no second GPU).
+
+---
+
+## 2026-09-09 · DATA CHARACTERISATION (eda.csv, all 199 videos) — strategy-changing
+
+Recovered from the failed run 2. Hard numbers at last:
+
+| quantity | value |
+|---|---|
+| videos | 199 |
+| annotated nodes | 133,318 total; **median 659/video** (50–1950) |
+| annotated edges | 128,883 |
+| frames/video | median 100 (40–100) |
+| **divisions** | **151 in the ENTIRE dataset** (87 videos have >=1) |
+| **gap edges (dt>1)** | **0** |
+| annotation fraction | **median 3.6%** (0.13%–20%) |
+| implied `N_true` | **median ~17,900/video**; ~4.7M total |
+| edge displacement | p50 **1.82 um**, p90 3.63 um (max 60.8 outlier) |
+
+### What this changes
+1. **Divisions are negligible — stop considering them.** 151 events dataset-wide
+   (~0.76/video). A 19-video val fold has ~14 division events, so `division_jaccard`
+   is statistical noise, at 0.1 weight, under a newly-stricter local metric.
+   **Optimise edge Jaccard alone.**
+2. **Gap recovery is definitively dead.** Zero dt>1 edges in GT *and* the scorer
+   discards them. Two independent confirmations.
+3. **The node-count penalty is MILD — I over-billed count calibration.** `N_true` is
+   ~17.9k/video while we predict far fewer, so the multiplier
+   `1 - 0.1*(N_pred - N_true)/N_true` is ~**1.07 when under-predicting** and only
+   drops below 1 past ~17.9k nodes. It's a **±7% effect**; edge Jaccard J is the
+   dominant term. Targeting `N_true` exactly is *not* optimal — the real objective is
+   `max_N J(N) * (1 - 0.1*(N - N_true)/N_true)`, and J's slope dominates.
+   => **We can afford to detect far more aggressively than the 0.99 threshold.**
+4. **Linking is probably NOT the bottleneck.** Median inter-frame displacement is
+   **1.82 um ~= 1 voxel** (grid is 1.625 um isotropic) against a 7 um match radius.
+   Association is geometrically easy; **detection recall is the bottleneck**, which is
+   exactly what PU + a lower threshold attack.
