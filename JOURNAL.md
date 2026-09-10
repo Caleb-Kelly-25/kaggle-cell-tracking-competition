@@ -236,3 +236,54 @@ Recovered from the failed run 2. Hard numbers at last:
    **1.82 um ~= 1 voxel** (grid is 1.625 um isotropic) against a 7 um match radius.
    Association is geometrically easy; **detection recall is the bottleneck**, which is
    exactly what PU + a lower threshold attack.
+
+---
+
+## 2026-09-10 · Session 4 — LINKING SWEEP: 0.6016 -> 0.6561 (+9.1%)
+
+### Root cause found (code + literature agree)
+`train:63` / `predict:615` use `softmax(dim=0)`: each t+1 child spreads exactly one
+unit of probability over parents at t, with **no null slot**. Every child is forced
+to take a parent, so a child whose real parent was never detected dumps its mass on
+a neighbour -> a fork. In-degree<=1 is free; **out-degree was never regulated**.
+Trackastra (ECCV 2024, won CTC ISBI 2024) fixes exactly this with a "parental
+softmax" `exp(a)/(1 + sum exp(a))` — the `+1` is the no-parent slot. It also masks
+attention beyond `d_max`. Our candidate generation was **all-pairs with no distance
+gate**, so the softmax normalised over nodes 100+ um away.
+
+### Round-1 sweep (inference-only, existing checkpoint, 5 val videos)
+
+| run | score | edge_J | node_recall |
+|---|---|---|---|
+| **nofork_gate12** | **0.6561** | 0.6649 | 0.9368 |
+| dual_gate12 | 0.6523 | 0.6621 | 0.9394 |
+| dual_null_gate12 | 0.6433 | 0.6490 | 0.9040 |
+| dual | 0.6426 | 0.6492 | 0.9155 |
+| gate8 | 0.6237 | 0.6355 | 0.9354 |
+| prune_nodes | 0.6214 | 0.6281 | 0.9228 |
+| gate12 | 0.6150 | 0.6258 | 0.9401 |
+| **control** | **0.6016** | 0.6149 | 0.9466 |
+| thr0.7_gate12 | 0.5790 | 0.5789 | 0.8792 |
+
+- **control reproduced run 1 exactly** (0.6016/0.6149/0.6007/0.9466) — the
+  "defaults are bit-identical" guarantee held, so the harness is trustworthy.
+- **Best = distance gate (12 um) + NO forks** (`--max-children-per-node 1`):
+  **+0.0545 (+9.1%)**, zero retraining. With 7 real divisions against 234 FPs,
+  never predicting a division is close to optimal.
+- Raising `--threshold` to 0.7 was clearly harmful (0.579), consistent with the
+  break-even-precision analysis: we were **under**-linking, not over-linking.
+
+### Operational lessons (cost us 3 failed runs)
+1. **`machine_shape` is REQUIRED in hand-written kernel-metadata.json.** Omitting it
+   gets an accelerator whose compute capability the installed torch has no kernels
+   for -> `CUDA error: no kernel image is available for execution on the device`.
+   This — not my PU code — is the likely cause of BOTH failed PU runs too.
+   Always set `"machine_shape": "NvidiaTeslaT4"`.
+2. **The Kaggle API returns a 0-byte log.** Always `subprocess.run(capture_output=True)`
+   and write stderr to a file under `/kaggle/working`, or failures are invisible.
+3. `check=False` makes a kernel report COMPLETE while producing nothing. Verify by
+   artifacts (results.csv), never by status.
+4. `kernel_sources` did NOT expose another kernel's checkpoint; vendoring the 8.4MB
+   checkpoint into the repo works and is simpler.
+5. `kaggle kernels output` is slow — don't wrap it in a short `timeout` or it
+   truncates before reaching alphabetically-late files.
