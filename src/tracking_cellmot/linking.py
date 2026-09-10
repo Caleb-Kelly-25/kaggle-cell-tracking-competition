@@ -119,6 +119,46 @@ def edge_probs(
     raise ValueError(f"Unknown edge_activation: {activation!r}")
 
 
+# Number of relative-geometry channels fed to the pair MLP, per mode.
+REL_CHANNELS = {"legacy": 3, "um": 5}
+
+
+def rel_pair_features(
+    coords_a: torch.Tensor,
+    coords_b: torch.Tensor,
+    mode: str = "legacy",
+    voxel_size: tuple[float, ...] | torch.Tensor | None = None,
+    scale_um: float = 4.0,
+) -> torch.Tensor:
+    """Relative-geometry features for every ``(a, b)`` pair.
+
+    ``legacy`` — ``(a - b) / 100`` in raw voxel units.  Two defects, both measured
+    on the trained checkpoint: the fixed ``/100`` puts a typical 1.8 um
+    displacement at ~0.01-0.045 alongside LayerNorm'd appearance features of
+    magnitude ~1 (the network compensated by growing these weights ~3x), and the
+    units are anisotropic, so the same physical distance in z produces a ~4x
+    smaller input than in x/y — leaving the z geometry signal ~2.7x weaker.
+
+    ``um`` — ``[d_um/s, |d|/s, exp(-|d|/s)]`` (5 channels, ``s = scale_um``).
+    Isotropic, O(1) across the realistic displacement range, and adds an explicit
+    distance magnitude plus a smooth proximity kernel (a soft version of the
+    distance gate).  At ``s = 4.0``: 1.8 um -> 0.46/0.63, 3.6 um -> 0.91/0.40,
+    12 um -> 3.0/0.05.
+    """
+    d = coords_a.unsqueeze(-2) - coords_b.unsqueeze(-3)
+    if mode == "legacy":
+        return d / 100.0
+    if mode != "um":
+        raise ValueError(f"Unknown rel_mode: {mode!r}")
+    if voxel_size is None:
+        raise ValueError("rel_mode='um' requires voxel_size (microns per voxel)")
+    if not isinstance(voxel_size, torch.Tensor):
+        voxel_size = torch.tensor(voxel_size, dtype=d.dtype, device=d.device)
+    d_um = d * voxel_size
+    r = d_um.norm(dim=-1, keepdim=True)
+    return torch.cat([d_um / scale_um, r / scale_um, torch.exp(-r / scale_um)], dim=-1)
+
+
 def pair_distance_um(
     coords_a: torch.Tensor,
     coords_b: torch.Tensor,

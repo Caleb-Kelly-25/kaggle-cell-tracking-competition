@@ -39,6 +39,10 @@ from tracking_cellmot.linking import (
     pair_distance_um,
 )
 from tracking_cellmot.models import SimpleNodeTransformer, TemporalUNet3D
+from tracking_cellmot.models.simple_node_transformer import (
+    LEGACY_VOXEL_SIZE,
+    migrate_pair_mlp_state,
+)
 
 from itertools import cycle as _cycle
 
@@ -504,6 +508,8 @@ class UNetNodeTransformer(nn.Module):
         n_heads: int = 4,
         n_blocks: int = 4,
         dropout: float = 0.3,
+        rel_mode: str = "legacy",
+        rel_scale_um: float = 4.0,
     ):
         super().__init__()
         self.unet = unet
@@ -517,6 +523,8 @@ class UNetNodeTransformer(nn.Module):
             n_heads=n_heads,
             n_blocks=n_blocks,
             dropout=dropout,
+            rel_mode=rel_mode,
+            rel_scale_um=rel_scale_um,
         )
 
     def _index_features(
@@ -588,11 +596,19 @@ class UNetNodeTransformer(nn.Module):
         pos_feat_tgt: torch.Tensor,   # (B, N_tgt, pos_feat_dim)
         mask_src: torch.Tensor,       # (B, N_src) bool
         mask_tgt: torch.Tensor,       # (B, N_tgt) bool
+        voxel_size: tuple[float, ...] | None = None,
     ) -> torch.Tensor:
-        """Run transformer edge predictor on pre-indexed UNet features."""
+        """Run transformer edge predictor on pre-indexed UNet features.
+
+        *coords* are ORIGINAL-resolution voxel indices (callers pass
+        ``detected_coords * downsample``), so *voxel_size* must be microns per
+        ORIGINAL voxel -- i.e. the dataset's ``scale``, NOT ``scale * downsample``.
+        Only used by ``rel_mode="um"``.
+        """
         feat_src = torch.cat([unet_feat_src, pos_feat_src], dim=-1)
         feat_tgt = torch.cat([unet_feat_tgt, pos_feat_tgt], dim=-1)
-        return self.transformer(feat_src, feat_tgt, coords_src, coords_tgt, mask_src, mask_tgt)
+        return self.transformer(feat_src, feat_tgt, coords_src, coords_tgt,
+                                mask_src, mask_tgt, voxel_size=voxel_size)
 
 
 # =============================================================================
@@ -938,6 +954,11 @@ def train_epoch(
         image_shape = tuple(batch["image_shape"][0].tolist())
         voxel_size = tuple(batch["voxel_size"][0].tolist())
         ds_scale = batch["downsample"][0].to(device)                                   # (3,)
+        # predict_edges gets coords scaled back to ORIGINAL resolution, so its
+        # microns-per-voxel is the dataset's `scale`, not voxel_size (= scale x downsample).
+        orig_voxel_size = tuple(
+            v / d for v, d in zip(voxel_size, batch["downsample"][0].tolist())
+        )
 
         torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -998,6 +1019,7 @@ def train_epoch(
                 frame_det[i][0] * ds_scale, frame_det[i + 1][0] * ds_scale,
                 frame_det[i][1], frame_det[i + 1][1],
                 frame_det[i][2], frame_det[i + 1][2],
+                voxel_size=orig_voxel_size,
             )
             # Physically implausible pairs are excluded from the loss entirely, so
             # training normalises over the same candidate set inference will use.
@@ -1079,6 +1101,9 @@ def evaluate(
         image_shape = tuple(batch["image_shape"][0].tolist())
         voxel_size = tuple(batch["voxel_size"][0].tolist())
         ds_scale = batch["downsample"][0].to(device)
+        orig_voxel_size = tuple(
+            v / d for v, d in zip(voxel_size, batch["downsample"][0].tolist())
+        )
 
         B, W = imgs.shape[:2]
         unet_out, det_logits = model.encode(imgs)
@@ -1117,6 +1142,7 @@ def evaluate(
                 frame_det[i][0] * ds_scale, frame_det[i + 1][0] * ds_scale,
                 frame_det[i][1], frame_det[i + 1][1],
                 frame_det[i][2], frame_det[i + 1][2],
+                voxel_size=orig_voxel_size,
             )
 
             for b in range(B):
@@ -1172,8 +1198,11 @@ def train(
     edge_null_logit: float = 0.0,
     train_gate_um: float = float("inf"),
     init_from: Path | None = None,
+    init_pair_mlp: str = "transfer",
     freeze_unet: bool = False,
     model_select: str = "legacy",
+    pair_rel_mode: str = "legacy",
+    pair_rel_scale_um: float = 4.0,
 ) -> UNetNodeTransformer:
     """Train on one fold from a pre-computed splits file.
 
@@ -1231,6 +1260,10 @@ def train(
         "edge_activation": _INFERENCE_ACTIVATION[edge_loss_mode],
         "null_logit": edge_null_logit,
         "gate_um": None if train_gate_um == float("inf") else train_gate_um,
+        # The pair-MLP input width depends on rel_mode, and load_state_dict is
+        # strict=True -- so a checkpoint is unloadable unless these are persisted.
+        "pair_rel_mode": pair_rel_mode,
+        "pair_rel_scale_um": pair_rel_scale_um,
     }
     (output_dir / "config.json").write_text(json.dumps(model_config, indent=2))
 
@@ -1308,14 +1341,30 @@ def train(
         unet=unet,
         unet_out_channels=unet_out_channels,
         pos_feat_dim=pos_feat_dim,
+        rel_mode=pair_rel_mode,
+        rel_scale_um=pair_rel_scale_um,
     ).to(device)
 
     # Warm start from a full checkpoint (before any DataParallel wrapping, which
     # would rename the state-dict keys).
     if init_from is not None:
         state = torch.load(init_from, map_location=device, weights_only=True)
+        # A legacy checkpoint has a narrower pair MLP than a `um` model. Reshape
+        # that one tensor, then load strictly: strict=False would also swallow a
+        # genuinely missing or misnamed key. With init_pair_mlp="transfer" the
+        # rescaling is function-preserving, so `--epochs 0` reproduces the
+        # source checkpoint's score exactly.
+        # LEGACY_VOXEL_SIZE is microns per ORIGINAL voxel, which is the space the
+        # coords are in by the time they reach predict_edges (they are multiplied
+        # by `downsample` at the call site), so no downsample correction applies.
+        state = migrate_pair_mlp_state(
+            state, model,
+            legacy_voxel_size=LEGACY_VOXEL_SIZE,
+            rel_scale_um=pair_rel_scale_um,
+            init=init_pair_mlp,
+        )
         model.load_state_dict(state)
-        print(f"  init-from: loaded {init_from}", flush=True)
+        print(f"  init-from: loaded {init_from} (pair_mlp={init_pair_mlp})", flush=True)
 
     if freeze_unet:
         model.unet.requires_grad_(False)
@@ -1479,6 +1528,23 @@ def main() -> None:
                              "(default inf = off). Median true displacement is ~1.8 um.")
     parser.add_argument("--init-from", type=str, default=None,
                         help="Warm-start from a full checkpoint (for fine-tuning).")
+    parser.add_argument("--init-pair-mlp", type=str, default="transfer",
+                        choices=["transfer", "zeros"],
+                        help="How to widen a legacy 3-channel pair MLP when --init-from a "
+                             "checkpoint trained with --pair-rel-mode legacy. 'transfer' "
+                             "rescales the geometry columns into microns and is "
+                             "function-preserving (so --epochs 0 reproduces the source "
+                             "score); 'zeros' drops the geometry term instead.")
+    parser.add_argument("--pair-rel-mode", type=str, default="legacy",
+                        choices=["legacy", "um"],
+                        help="Relative-geometry features for the pair MLP. 'legacy' is "
+                             "(a-b)/100 in raw voxels: anisotropic (the same physical "
+                             "distance in z gives a ~4x smaller input than in x/y) and ~0.01 "
+                             "next to LayerNorm'd features of magnitude ~1. 'um' is "
+                             "[d_um/s, |d|/s, exp(-|d|/s)]: isotropic, O(1), and adds an "
+                             "explicit distance plus a smooth proximity kernel.")
+    parser.add_argument("--pair-rel-scale-um", type=float, default=4.0,
+                        help="Length scale s (microns) for --pair-rel-mode um.")
     parser.add_argument("--freeze-unet", action="store_true",
                         help="Freeze the UNet + detection head, and switch them to eval() so "
                              "BatchNorm stops updating. Holds node_recall fixed so an A/B "
@@ -1535,9 +1601,12 @@ def main() -> None:
             edge_null_logit=args.edge_null_logit,
             train_gate_um=args.train_gate_um,
             init_from=Path(args.init_from) if args.init_from else None,
+            init_pair_mlp=args.init_pair_mlp,
             freeze_unet=args.freeze_unet,
             seed=args.seed,
             model_select=args.model_select,
+            pair_rel_mode=args.pair_rel_mode,
+            pair_rel_scale_um=args.pair_rel_scale_um,
         )
 
 

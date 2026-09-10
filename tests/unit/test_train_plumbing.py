@@ -126,7 +126,77 @@ def test_inference_activation_map_covers_every_loss_mode() -> None:
 
     A model trained with a null slot is miscalibrated if scored without one.
     """
-    modes = set(inspect.signature(train_mod.compute_loss).parameters["mode"].annotation
-                if False else ["colsoftmax", "parental", "dual", "sigmoid"])
-    for mode in modes:
+    for mode in ("colsoftmax", "parental", "dual", "sigmoid"):
         assert f'"{mode}":' in _SOURCE, f"{mode} missing from the activation map"
+
+
+# ---------------------------------------------------------------------------
+# Pair-geometry plumbing (Step 6)
+# ---------------------------------------------------------------------------
+
+predict_mod = pytest.importorskip("predict_unet_transformer")
+_PREDICT_SOURCE = Path(predict_mod.__file__).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("name", ["pair_rel_mode", "pair_rel_scale_um", "init_pair_mlp"])
+def test_train_accepts_pair_geometry_parameter(name: str) -> None:
+    assert name in inspect.signature(train_mod.train).parameters
+
+
+@pytest.mark.parametrize("flag", ["--pair-rel-mode", "--pair-rel-scale-um", "--init-pair-mlp"])
+def test_pair_geometry_flag_is_defined_and_forwarded(flag: str) -> None:
+    assert f'"{flag}"' in _SOURCE, f"{flag} is not defined in the parser"
+    dest = flag.lstrip("-").replace("-", "_")
+    assert f"args.{dest}" in _SOURCE, f"{flag} is parsed but never forwarded to train()"
+
+
+def test_pair_geometry_is_persisted_to_config() -> None:
+    """`load_state_dict` is strict and the pair-MLP width depends on rel_mode.
+
+    A checkpoint trained with `um` geometry is simply unloadable if the config
+    does not record it, so this is a hard requirement, not a nicety.
+    """
+    for key in ("pair_rel_mode", "pair_rel_scale_um"):
+        assert f'"{key}":' in _SOURCE, f"train never writes {key} to config.json"
+        assert f'config["{key}"]' in _PREDICT_SOURCE, f"load_model never reads {key}"
+
+
+def test_predict_default_config_makes_v1_checkpoints_load_as_legacy() -> None:
+    """Configs written before this change have no pair_rel_mode key."""
+    assert predict_mod._DEFAULT_CONFIG["pair_rel_mode"] == "legacy"
+
+
+@pytest.mark.parametrize("module", ["train", "predict"])
+def test_every_predict_edges_call_passes_original_resolution_voxel_size(module: str) -> None:
+    """The scale-space trap: `voxel_size` in these scripts is NOT what to pass.
+
+    Call sites hand `predict_edges` coords multiplied back up to ORIGINAL
+    resolution (`coords * downsample`), so the microns-per-voxel it needs is the
+    dataset's `scale`. The local named `voxel_size` is `scale * downsample`
+    (used for pooling and gating), which is 4x too large in y/x here -- passing
+    it would silently quadruple every physical displacement the pair MLP sees,
+    with no error anywhere. Both scripts bind the correct value as
+    `orig_voxel_size`; this pins that every call site uses it.
+    """
+    import ast
+
+    source = _SOURCE if module == "train" else _PREDICT_SOURCE
+    calls = [
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "predict_edges"
+    ]
+    assert calls, f"no predict_edges call found in {module} -- test is stale"
+    for call in calls:
+        kw = {k.arg: k.value for k in call.keywords}
+        assert "voxel_size" in kw, (
+            f"{module}:{call.lineno} calls predict_edges without voxel_size; "
+            f"rel_mode='um' would raise"
+        )
+        val = kw["voxel_size"]
+        assert isinstance(val, ast.Name) and val.id == "orig_voxel_size", (
+            f"{module}:{call.lineno} passes "
+            f"{ast.unparse(val)!r} -- must be `orig_voxel_size` (= scale), not the "
+            f"downsampled `voxel_size` (= scale * downsample)"
+        )

@@ -92,6 +92,12 @@ class PredictConfig:
     # nodes, it stops distant nodes from stealing probability mass.
     gate_um: float = float("inf")     # inf = no gate (legacy behaviour)
     null_logit: float = 0.0           # only used by the "*_null" activations
+    # Linker ablation.  "geometry" replaces the learned edge logits with -d_um/T,
+    # changing nothing else in the pipeline.  If it scores near the learned
+    # linker, the transformer is barely beating nearest-neighbour and the effort
+    # belongs in motion modelling rather than a bigger model.
+    linker: str = "learned"           # "learned" | "geometry"
+    geometry_temp_um: float = 2.0     # T; ~the median true displacement (1.8 um)
 
     # ILP post-processing
     use_ilp: bool = False
@@ -295,6 +301,9 @@ _DEFAULT_CONFIG = {
     "unet_layers": [32, 64, 128],
     "downsample": [1, 4, 4],
     "window_size": 2,
+    # v1 configs predate the pair-geometry switch, so the absent key means legacy.
+    "pair_rel_mode": "legacy",
+    "pair_rel_scale_um": 4.0,
 }
 
 
@@ -331,6 +340,10 @@ def load_model(
         unet=unet,
         unet_out_channels=config["unet_out_channels"],
         pos_feat_dim=4 * _POS_EMBED_DIM,
+        # These change the pair-MLP input width, so getting them from anywhere
+        # other than the checkpoint's own config is a strict-load failure.
+        rel_mode=config["pair_rel_mode"],
+        rel_scale_um=config["pair_rel_scale_um"],
     )
     state = torch.load(weights_path, map_location=device, weights_only=True)
     model.load_state_dict(state)
@@ -492,6 +505,9 @@ def predict_video(
     W = window_size
     voxel_size = tuple(s * d for s, d in zip(ds.scale, downsample))
     pool_k = pool_kernel_from_um(cfg.pool_kernel_um, voxel_size)
+    # predict_edges receives coords rescaled to ORIGINAL resolution (* ds_arr_t),
+    # so its microns-per-voxel is ds.scale, not the downsampled voxel_size above.
+    orig_voxel_size = tuple(float(s) for s in ds.scale)
 
     # Count calibration: convert a per-video node target into a per-frame quota.
     target_total = cfg.target_nodes
@@ -611,26 +627,39 @@ def predict_video(
             p_mask_src = torch.ones(1, n_src, dtype=torch.bool, device=device)
             p_mask_tgt = torch.ones(1, n_tgt, dtype=torch.bool, device=device)
 
-            unet_feat_src = model._index_features(
-                unet_out[:, f_idx], p_coords_src, p_mask_src,
-            )
-            unet_feat_tgt = model._index_features(
-                unet_out[:, f_idx + 1], p_coords_tgt, p_mask_tgt,
-            )
-            edge_logits_pair = model.predict_edges(
-                unet_feat_src, unet_feat_tgt,
-                p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,
-                p_pos_src, p_pos_tgt,
-                p_mask_src, p_mask_tgt,
-            )  # (1, n_src, n_tgt)
-
-            raw = edge_logits_pair[0]
-
-            # Physical (um) distance between every candidate pair, for gating.
+            # Physical (um) distance between every candidate pair. Used for
+            # gating, and as the score itself under --linker geometry.
             cs = coords_so_far[idx_src, 1:].astype(np.float32)
             ct = coords_so_far[idx_tgt, 1:].astype(np.float32)
             vs_np = np.asarray(voxel_size, dtype=np.float32)
             d_um = np.linalg.norm((cs[:, None, :] - ct[None, :, :]) * vs_np, axis=-1)
+
+            if cfg.linker == "geometry":
+                # Diagnostic ablation: score pairs by proximity alone, bypassing
+                # the learned model entirely. Detections, gate, activation,
+                # threshold and degree caps are all unchanged, so the gap against
+                # the default run is exactly what the transformer buys over
+                # "nearest neighbour". Using -d/T as the logit makes the column
+                # softmax a Boltzmann distribution over candidate parents with
+                # temperature T microns, so the existing threshold stays meaningful.
+                raw = torch.from_numpy(
+                    (-d_um / cfg.geometry_temp_um).astype(np.float32)
+                ).to(device)
+            else:
+                unet_feat_src = model._index_features(
+                    unet_out[:, f_idx], p_coords_src, p_mask_src,
+                )
+                unet_feat_tgt = model._index_features(
+                    unet_out[:, f_idx + 1], p_coords_tgt, p_mask_tgt,
+                )
+                edge_logits_pair = model.predict_edges(
+                    unet_feat_src, unet_feat_tgt,
+                    p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,
+                    p_pos_src, p_pos_tgt,
+                    p_mask_src, p_mask_tgt,
+                    voxel_size=orig_voxel_size,
+                )  # (1, n_src, n_tgt)
+                raw = edge_logits_pair[0]
 
             gate_np = None
             if np.isfinite(cfg.gate_um):
@@ -806,6 +835,8 @@ def predict(
                 "threshold": cfg.threshold,
                 "gate_um": cfg.gate_um,
                 "null_logit": cfg.null_logit,
+                "linker": cfg.linker,
+                "geometry_temp_um": cfg.geometry_temp_um,
                 "max_children_per_node": cfg.max_children_per_node,
                 "max_parents_per_node": cfg.max_parents_per_node,
                 "det_tta": cfg.det_tta,
@@ -875,6 +906,16 @@ def main() -> None:
                              "(default inf = no gate). Median true displacement is ~1.8 um.")
     parser.add_argument("--null-logit", type=float, default=0.0,
                         help="Null-parent logit for the '*_null' activations (default 0.0).")
+    parser.add_argument("--linker", type=str, default="learned",
+                        choices=["learned", "geometry"],
+                        help="Edge scoring function. 'geometry' is a diagnostic ablation "
+                             "that scores pairs by -distance/T alone, bypassing the "
+                             "transformer while keeping detections, gate, activation, "
+                             "threshold and degree caps identical -- so the gap to a "
+                             "'learned' run is what the model adds over nearest-neighbour.")
+    parser.add_argument("--geometry-temp-um", type=float, default=2.0,
+                        help="Temperature T (microns) for --linker geometry (default 2.0, "
+                             "about the median true displacement).")
     parser.add_argument("--max-children-per-node", type=int, default=None,
                         help="Greedy cap on outgoing edges per node (default 2; 1 = no divisions).")
     parser.add_argument("--max-parents-per-node", type=int, default=None,
@@ -927,6 +968,8 @@ def main() -> None:
         threshold=args.threshold,
         gate_um=args.gate_um,
         null_logit=args.null_logit,
+        linker=args.linker,
+        geometry_temp_um=args.geometry_temp_um,
         max_children_per_node=args.max_children_per_node,
         max_parents_per_node=args.max_parents_per_node,
         use_ilp=args.use_ilp,

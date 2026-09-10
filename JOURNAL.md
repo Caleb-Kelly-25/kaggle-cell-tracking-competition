@@ -353,3 +353,54 @@ scored under three activations.
 **Open caveat:** `_evaluate_pair` still computes the held-out loss with the legacy
 softmax, so `--model-select loss` ranks epochs consistently but not under the arm's
 own objective. Fine for picking an epoch within a run; not comparable across arms.
+
+## 2026-09-10 — Step 6 (pair geometry) landed + geometry-only diagnostic
+
+### Pair geometry is now switchable, and the switch is free
+`--pair-rel-mode {legacy,um}` on train; persisted to `config.json` as
+`pair_rel_mode`/`pair_rel_scale_um` and read back by `load_model`. This is not
+optional bookkeeping: `load_state_dict` is `strict=True` and the pair-MLP input
+width changes with the mode (259 -> 261), so an unrecorded mode makes a
+checkpoint simply unloadable.
+
+`um` replaces `(a-b)/100` with `[d_um/s, |d|/s, exp(-|d|/s)]` at `s = 4 um`,
+fixing two measured defects: the legacy features are **anisotropic** (the same
+physical distance in z gives a ~4x smaller input than in x/y, leaving the z
+geometry signal ~2.7x weaker) and **tiny** (~0.01-0.045 next to LayerNorm'd
+appearance features of magnitude ~1).
+
+**Verified on the real vendored checkpoint**, not just synthetic models: migrate
+`baseline_split0` into a `um` model with `--init-pair-mlp transfer`, load
+`strict=True` (0 missing, 0 unexpected), and the `predict_edges` logits agree to
+**3.8e-6** across a 40x37 pair matrix spanning [-26.3, -1.2]. So the architecture
+change cannot move the measured baseline, and Phase 1 (`--epochs 0` reproduces
+0.6561) is de-risked before spending a GPU hour.
+
+### The scale-space trap this exposed
+Call sites hand `predict_edges` coords already multiplied **back up to original
+resolution** (`coords * downsample`), so its microns-per-voxel is the dataset's
+`scale` — *not* the local named `voxel_size`, which is `scale * downsample` and
+is what pooling and gating use. Passing the obvious variable would have silently
+quadrupled every physical displacement in y/x with no error anywhere. Both
+scripts now bind `orig_voxel_size` explicitly, and an AST test asserts every
+`predict_edges` call site passes exactly that — **confirmed to reject both the
+wrong-variable and the missing-argument forms.**
+
+### Geometry-only diagnostic (`--linker geometry`)
+Scores pairs by `-d_um / T` alone, bypassing the transformer. Detections, gate,
+activation, threshold and degree caps are untouched, so the gap to a `learned`
+run is precisely what the model adds over nearest-neighbour. AST tests pin that
+the branch forks *only* the score (it may not touch `gate_um`, `edge_probs`,
+`threshold` or the degree caps) — otherwise the comparison would confound the
+linker with those changes and the conclusion would be unfounded.
+`T = 2.0 um` by default (about the median true displacement); under the column
+softmax this makes the scores a Boltzmann distribution over candidate parents,
+so the existing `--threshold` stays meaningful.
+
+98 unit tests passing, no data or GPU required.
+
+### Blocked
+The Kaggle API token in `~/.kaggle/kaggle.json` (user `michaelangel23`) is being
+rejected — `kernels.get` denied on the correct slug, and `kernels list --mine`
+reports "Authentication required". Cannot reach `cellmot-retrain-arms` or pull
+B0/B1 results until a new token is generated at kaggle.com/settings/api.
