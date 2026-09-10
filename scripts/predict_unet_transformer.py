@@ -23,6 +23,8 @@ from tqdm import tqdm
 import tracksdata as td
 
 from tracking_cellmot.io import open_dataset, save_graph
+# Single shared implementation so training and inference cannot drift apart.
+from tracking_cellmot.linking import GATE_FILL, edge_probs as _edge_probs
 
 # Import model and helpers from companion training script.
 sys.path.insert(0, str(Path(__file__).parent))
@@ -279,43 +281,9 @@ def _append_results_csv(path: Path, row: dict) -> None:
         writer.writerow(row)
 
 
-def _edge_probs(
-    raw: torch.Tensor,
-    activation: str = "softmax",
-    null_logit: float = 0.0,
-) -> torch.Tensor:
-    """Convert raw pair logits ``(n_src, n_tgt)`` into edge probabilities.
-
-    ``softmax`` (legacy) normalises down each *column*, so every target at t+1
-    spreads exactly one unit of probability across candidate parents at t. That
-    forces every child to take a parent, which is the structural reason this
-    model over-predicts divisions: a child whose real parent was never detected
-    still hands its full unit of mass to some neighbouring node, creating a fork.
-
-    ``*_null`` adds a null logit to the denominator so a detection may have NO
-    parent -- Trackastra's "parental softmax", ``exp(a) / (exp(b) + sum exp(a))``.
-    That is exactly ``col_softmax * sigmoid(logsumexp - null_logit)``.
-
-    ``dual_*`` multiplies the column term by the row term, penalising a parent
-    that is splitting its own mass across several children -- i.e. it regulates
-    out-degree, which the column softmax never did.
-    """
-    if activation == "sigmoid":
-        return torch.sigmoid(raw)
-
-    use_null = activation.endswith("_null")
-    col = torch.softmax(raw, dim=0)
-    if use_null:
-        col = col * torch.sigmoid(torch.logsumexp(raw, dim=0, keepdim=True) - null_logit)
-
-    if activation in ("softmax", "softmax_null"):
-        return col
-    if activation in ("dual_softmax", "dual_softmax_null"):
-        row = torch.softmax(raw, dim=1)
-        if use_null:
-            row = row * torch.sigmoid(torch.logsumexp(raw, dim=1, keepdim=True) - null_logit)
-        return torch.sqrt(col * row)
-    raise ValueError(f"Unknown edge_activation: {activation!r}")
+# `_edge_probs` is imported from tracking_cellmot.linking (see imports above).
+# It previously lived here as a second copy; the training loss now optimises the
+# same normalisation, so keeping one implementation is what stops them drifting.
 
 
 # =============================================================================
@@ -668,7 +636,7 @@ def predict_video(
             if np.isfinite(cfg.gate_um):
                 gate_np = d_um <= cfg.gate_um
                 raw = raw.masked_fill(
-                    torch.from_numpy(~gate_np).to(raw.device), -1e4,
+                    torch.from_numpy(~gate_np).to(raw.device), GATE_FILL,
                 )
 
             probs = _edge_probs(raw, cfg.edge_activation, cfg.null_logit).cpu().numpy()

@@ -30,6 +30,12 @@ from tqdm import tqdm
 import tracksdata as td
 
 from tracking_cellmot.io import invert_time_graph, open_dataset
+from tracking_cellmot.linking import (
+    GATE_FILL,
+    focal_bce_from_logits,
+    focal_bce_from_logp,
+    null_log_softmax,
+)
 from tracking_cellmot.models import SimpleNodeTransformer, TemporalUNet3D
 
 from itertools import cycle as _cycle
@@ -52,24 +58,82 @@ def compute_gt_transition_matrix(
     return matrix
 
 
-def compute_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """BCE on annotated rows and columns (sparse GT — unannotated cells ignored)."""
+def compute_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    mode: str = "colsoftmax",
+    gate: torch.Tensor | None = None,
+    sigmoid_weight: float = 0.0,
+    focal_gamma: float = 2.0,
+    null_logit: float = 0.0,
+) -> torch.Tensor:
+    """Focal BCE over the annotated rows/columns of one frame pair.
+
+    The ground truth is ~3.6% complete, so only entries lying in an annotated row
+    or column are supervised.  Those negatives are genuine: annotated tracks are
+    essentially complete (133k nodes / 129k edges), so an annotated cell's real
+    child is also annotated.
+
+    ``mode``
+        ``colsoftmax`` — legacy.  Normalises down each column, so every child at
+        t+1 is *forced* to take a parent at t.  With no "no-parent" option a child
+        whose real parent was never detected still hands its mass to a neighbour,
+        which is the structural cause of the model's ~35x over-prediction of
+        divisions.  Kept as the default so the measured baseline stays reproducible.
+
+        ``parental`` — column softmax with a null-parent slot (Trackastra, ECCV 2024).
+        Regulates in-degree.
+
+        ``dual`` — mean of the column and row null-softmax losses.  The row term
+        penalises a parent splitting its mass across children, i.e. it regulates
+        OUT-degree, which is our measured failure mode.  Primary arm.
+
+        ``sigmoid`` — independent per-edge BCE; invariant to the number of
+        candidate sources, so it is unaffected by the train/inference detector
+        mismatch.
+
+    *gate* is an optional boolean mask of physically plausible pairs; gated
+    entries are pushed to ``GATE_FILL`` and dropped from the supervised mask.
+    """
     active_rows = target.sum(dim=1) > 0
     active_cols = target.sum(dim=0) > 0
     mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
+    if gate is not None:
+        logits = logits.masked_fill(~gate, GATE_FILL)
+        mask = mask & gate
     if not mask.any():
         return torch.tensor(0.0, requires_grad=True, device=logits.device)
 
-    probs = torch.softmax(logits, dim=0)  # dim=0 intentional: divisions allowed, merges aren't
-    bce = F.binary_cross_entropy(probs, target, reduction="none")
-    p_t = probs * target + (1 - probs) * (1 - target)
-    loss = ((1 - p_t) ** 2) * bce
+    if mode == "colsoftmax":
+        # Bit-identical to the loss that produced the measured baseline.  (The old
+        # `weight[div_rows] = 1.0` multiply was a no-op on an ones_like tensor.)
+        probs = torch.softmax(logits, dim=0)
+        bce = F.binary_cross_entropy(probs, target, reduction="none")
+        p_t = probs * target + (1 - probs) * (1 - target)
+        return (((1 - p_t) ** 2) * bce)[mask].mean()
 
-    div_rows = target.sum(dim=1) > 1
-    weight = torch.ones_like(loss)
-    weight[div_rows] = 1.0
+    if mode == "sigmoid":
+        loss = focal_bce_from_logits(logits, target, focal_gamma)
+    elif mode == "parental":
+        loss = focal_bce_from_logp(
+            null_log_softmax(logits, 0, null_logit), target, focal_gamma)
+    elif mode == "dual":
+        # Averaging the two BCEs (rather than multiplying probabilities) is what
+        # makes this consistent with the `dual_softmax_null` activation used at
+        # inference: for a positive, -0.5*(log p_col + log p_row) is exactly
+        # -log sqrt(p_col * p_row).
+        col = focal_bce_from_logp(
+            null_log_softmax(logits, 0, null_logit), target, focal_gamma)
+        row = focal_bce_from_logp(
+            null_log_softmax(logits, 1, null_logit), target, focal_gamma)
+        loss = 0.5 * (col + row)
+    else:
+        raise ValueError(f"Unknown edge loss mode: {mode!r}")
 
-    return (loss * weight)[mask].mean()
+    if sigmoid_weight:
+        loss = loss + sigmoid_weight * focal_bce_from_logits(logits, target, focal_gamma)
+    return loss[mask].mean()
 
 
 def compute_batch_loss(

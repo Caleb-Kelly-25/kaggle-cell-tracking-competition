@@ -1,7 +1,50 @@
 """Pytest configuration and shared fixtures."""
 
+import importlib
 import sys
+import types
 from pathlib import Path
+
+
+class _StubModule(types.ModuleType):
+    """Stand-in for a heavy optional dependency, creating submodules on demand.
+
+    ``__file__``/``__path__`` must be real values: torch's inspect-based helpers
+    walk module ``__file__`` attributes and crash on anything exotic.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.__file__ = "<stub>"
+        self.__path__ = []
+
+    def __getattr__(self, item: str):
+        if item.startswith("__"):
+            raise AttributeError(item)
+        sub = _StubModule(f"{self.__name__}.{item}")
+        setattr(self, item, sub)
+        return sub
+
+
+def _install_dependency_stubs() -> None:
+    """Stub only the dependencies that are genuinely absent.
+
+    The pure-torch unit tests under ``tests/unit`` exercise the loss, the model and
+    the linking helpers without any data.  Those modules still import
+    ``polars``/``zarr``/``tracksdata`` transitively, which aren't installed in a
+    bare dev environment.  Pytest loads ancestor conftests before collecting any
+    test, so without this the whole suite fails at collection.  When the real
+    package is importable this is a no-op, so CI and Kaggle use the real ones.
+    """
+    for name in ("polars", "zarr", "tracksdata", "geff",
+                 "scipy", "scipy.ndimage", "dask", "dask.array"):
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            sys.modules.setdefault(name, _StubModule(name))
+
+
+_install_dependency_stubs()
 
 import numpy as np
 import polars as pl
@@ -10,6 +53,9 @@ import tracksdata as td
 import zarr
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+# `tracking_cellmot` lives under src/ and is only importable after `pip install -e .`;
+# add it explicitly so the unit tests run in a bare dev environment too.
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 _FIXTURE_DIR = Path(__file__).parent / "data" / "division_clip"
 _FIXTURE_NAME = "division_clip"
