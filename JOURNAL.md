@@ -179,3 +179,16 @@ Rank by (expected gain per GPU-hour) x P(works), not novelty.
   degenerates at pi~1e-5; at candidate level pi is O(0.1-0.9) and
   `estimated_number_of_nodes` *gives* us the prior), track-consistency
   self-training, controlled annotation-sparsity sweep.
+
+### Parallel runs launched (matched A/B)
+- **Kaggle allows >=2 concurrent GPU kernels** on this account (confirmed empirically).
+- `notebookce6b79f8c0` = **BCE control** (clones upstream).
+- `cellmot-pu-run2` = **PU arm** (clones the fork), `--method pu --detection-loss pu
+  --pu-gate-power 2.0`, otherwise identical.
+- **Confound avoided:** run 2's Cell 6 explicitly passes `--min-track-nodes 1
+  --max-out-degree 0 --max-in-degree 0`. Without that it would clone the fork's new
+  pruning defaults and differ from the control by *two* variables (loss + inference),
+  making the A/B meaningless. Cells 7/8 stubbed (no test predict/submission needed).
+- Both log to `results.csv`. Cost ~10 GPU-h of the 30/week.
+- **Never push a new version to a kernel that is running** — it supersedes the job.
+  Parallel runs require a separate kernel id.
