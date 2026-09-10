@@ -24,7 +24,7 @@ import tracksdata as td
 
 from tracking_cellmot.io import open_dataset, save_graph
 # Single shared implementation so training and inference cannot drift apart.
-from tracking_cellmot.linking import GATE_FILL, edge_probs as _edge_probs
+from tracking_cellmot.linking import GATE_FILL, edge_probs as _edge_probs, greedy_select
 
 # Import model and helpers from companion training script.
 sys.path.insert(0, str(Path(__file__).parent))
@@ -98,6 +98,14 @@ class PredictConfig:
     # belongs in motion modelling rather than a bigger model.
     linker: str = "learned"           # "learned" | "geometry"
     geometry_temp_um: float = 2.0     # T; ~the median true displacement (1.8 um)
+    # Selective division.  `max_children_per_node` alone cannot trade off
+    # divisions, because it cannot see confidence: 1 gives TP=0/FP=0/FN=7 (no
+    # division credit at all) and 2 gives TP=2/FP=234 (J=0.008) while also
+    # costing edge Jaccard.  With a threshold, out-degree stays 1 by default and
+    # a second child is admitted only above its own (high) probability, so
+    # division recall is bought a few edges at a time instead of all at once.
+    division_threshold: float | None = None   # None = off (cap governs alone)
+    division_max_children: int = 2            # hard ceiling on a fork
 
     # ILP post-processing
     use_ilp: bool = False
@@ -674,30 +682,21 @@ def predict_video(
                 # renormalise to a uniform (and possibly supra-threshold) value.
                 probs = np.where(gate_np, probs, 0.0)
 
-            sel = np.argwhere(probs > cfg.threshold)
-            if sel.size:
-                sel = sel[np.argsort(-probs[sel[:, 0], sel[:, 1]])]
-            candidates = [(float(probs[i, j]), int(i), int(j)) for i, j in sel]
-
-            children_count: dict[int, int] = {}
-            parents_count: dict[int, int] = {}
-
-            for prob, i, j in candidates:
-                n_ch = children_count.get(i, 0)
-                n_pa = parents_count.get(j, 0)
-                if cfg.max_children_per_node is not None and n_ch >= cfg.max_children_per_node:
-                    continue
-                if cfg.max_parents_per_node is not None and n_pa >= cfg.max_parents_per_node:
-                    continue
-
+            # One shared decision rule (see tracking_cellmot.linking): keeping a
+            # second copy here is how train/inference silently drift apart.
+            for i, j, prob in greedy_select(
+                probs, cfg.threshold,
+                max_children=cfg.max_children_per_node,
+                max_parents=cfg.max_parents_per_node,
+                division_threshold=cfg.division_threshold,
+                division_max_children=cfg.division_max_children,
+            ):
                 gi, gj = int(idx_src[i]), int(idx_tgt[j])
                 dist = float(np.linalg.norm(
                     coords_so_far[gi, 1:].astype(np.float32)
                     - coords_so_far[gj, 1:].astype(np.float32)
                 ))
                 all_edges.append((gi, gj, float(prob), dist))
-                children_count[i] = n_ch + 1
-                parents_count[j] = n_pa + 1
 
         del unet_out
 
@@ -837,6 +836,8 @@ def predict(
                 "null_logit": cfg.null_logit,
                 "linker": cfg.linker,
                 "geometry_temp_um": cfg.geometry_temp_um,
+                "division_threshold": cfg.division_threshold,
+                "division_max_children": cfg.division_max_children,
                 "max_children_per_node": cfg.max_children_per_node,
                 "max_parents_per_node": cfg.max_parents_per_node,
                 "det_tta": cfg.det_tta,
@@ -916,6 +917,16 @@ def main() -> None:
     parser.add_argument("--geometry-temp-um", type=float, default=2.0,
                         help="Temperature T (microns) for --linker geometry (default 2.0, "
                              "about the median true displacement).")
+    parser.add_argument("--division-threshold", type=float, default=None,
+                        help="Allow a node a SECOND child (i.e. predict a division) only "
+                             "when that edge's probability is at least this. Off by "
+                             "default, leaving --max-children-per-node in charge. The cap "
+                             "alone cannot trade divisions off: 1 scores zero division "
+                             "credit, 2 yielded TP=2/FP=234. Score weights divisions at "
+                             "0.1*TP/(TP+FP+FN), so precision is what pays.")
+    parser.add_argument("--division-max-children", type=int, default=2,
+                        help="Hard ceiling on children when --division-threshold admits a "
+                             "fork (default 2).")
     parser.add_argument("--max-children-per-node", type=int, default=None,
                         help="Greedy cap on outgoing edges per node (default 2; 1 = no divisions).")
     parser.add_argument("--max-parents-per-node", type=int, default=None,
@@ -970,6 +981,8 @@ def main() -> None:
         null_logit=args.null_logit,
         linker=args.linker,
         geometry_temp_um=args.geometry_temp_um,
+        division_threshold=args.division_threshold,
+        division_max_children=args.division_max_children,
         max_children_per_node=args.max_children_per_node,
         max_parents_per_node=args.max_parents_per_node,
         use_ilp=args.use_ilp,

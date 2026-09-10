@@ -159,6 +159,72 @@ def rel_pair_features(
     return torch.cat([d_um / scale_um, r / scale_um, torch.exp(-r / scale_um)], dim=-1)
 
 
+def greedy_select(
+    probs,
+    threshold: float,
+    max_children: int | None = 1,
+    max_parents: int | None = 1,
+    division_threshold: float | None = None,
+    division_max_children: int = 2,
+) -> list[tuple[int, int, float]]:
+    """Greedily accept edges, highest probability first, under degree caps.
+
+    Returns ``(src, tgt, prob)`` triples. Taking edges in descending probability
+    means the caps discard our *weakest* links rather than an arbitrary set --
+    the scorer itself caps out-degree by edge id, which can throw away the best
+    one.
+
+    ``division_threshold`` gates the SECOND child specifically. The two
+    decisions have opposite error costs: a wrong second child costs both an edge
+    FP and a division FP, while a missed one forfeits division credit worth
+    ``0.1/n_div``. A plain cap cannot make that trade because it cannot see
+    confidence -- measured, ``max_children=1`` gives TP=0/FP=0/FN=7 and
+    ``max_children=2`` gives TP=2/FP=234. With a threshold, out-degree stays 1
+    unless the extra edge clears its own bar.
+
+    Under ``dual_softmax`` the threshold has a principled range rather than an
+    arbitrary one, because ``sqrt(p_col * p_row)`` separates the cases::
+
+        confident 1-1 link                    1.000
+        true division, each child             0.707   ( = sqrt(1 * 1/2) )
+        2x2 confusion (genuine ambiguity)     0.500
+        distractor parent                     0.095
+
+    A dividing parent splits its row mass evenly while each child still has one
+    clear parent, so ``1/sqrt(2)`` is the signature of a clean two-way split and
+    ``0.5`` the signature of not knowing. Hence 0.55-0.70 is the interesting
+    band: above 0.707 admits nothing, below 0.5 admits the confusions too.
+
+    Kept numpy-only (no torch) so it is importable and testable anywhere.
+    """
+    import numpy as _np
+
+    sel = _np.argwhere(probs > threshold)
+    if sel.size:
+        sel = sel[_np.argsort(-probs[sel[:, 0], sel[:, 1]])]
+
+    children: dict[int, int] = {}
+    parents: dict[int, int] = {}
+    out: list[tuple[int, int, float]] = []
+
+    for i, j in sel:
+        i, j = int(i), int(j)
+        p = float(probs[i, j])
+        n_ch = children.get(i, 0)
+        n_pa = parents.get(j, 0)
+        if max_children is not None and n_ch >= max_children:
+            if (division_threshold is None
+                    or n_ch >= division_max_children
+                    or p < division_threshold):
+                continue
+        if max_parents is not None and n_pa >= max_parents:
+            continue
+        out.append((i, j, p))
+        children[i] = n_ch + 1
+        parents[j] = n_pa + 1
+    return out
+
+
 def pair_distance_um(
     coords_a: torch.Tensor,
     coords_b: torch.Tensor,
