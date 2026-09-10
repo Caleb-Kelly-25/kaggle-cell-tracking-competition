@@ -25,7 +25,7 @@ def test_train_accepts_parameter(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", [
-    "edge_loss", "edge_sigmoid_weight", "edge_focal_gamma",
+    "edge_loss_mode", "edge_sigmoid_weight", "edge_focal_gamma",
     "edge_null_logit", "train_gate_um", "freeze_unet",
 ])
 def test_train_epoch_accepts_parameter(name: str) -> None:
@@ -44,18 +44,73 @@ def test_cli_flag_is_defined_and_forwarded(flag: str) -> None:
     assert f"args.{dest}" in _SOURCE, f"{flag} is parsed but never forwarded to train()"
 
 
-def test_edge_loss_param_is_not_shadowed_by_the_loop_variable() -> None:
-    """The epoch loop rebinds `edge_loss` to the returned loss value.
+@pytest.mark.parametrize("func", ["train", "train_epoch"])
+def test_no_function_takes_a_parameter_it_rebinds(func: str) -> None:
+    """`edge_loss` is assigned inside BOTH train() and train_epoch().
 
-    If the config parameter were also called `edge_loss`, every epoch after the
-    first would pass a float where a mode string is expected.
+    train():       `edge_loss, det_loss = train_epoch(...)`
+    train_epoch(): `edge_loss = sum(block_losses) / len(block_losses)`
+
+    A parameter of that name is therefore clobbered with a loss tensor after the
+    first iteration, and the next call receives a tensor where a mode string is
+    expected. This actually happened: a GPU run died with
+    "Unknown edge loss mode: tensor(0.0017, ...)". Both must use `edge_loss_mode`.
     """
-    params = inspect.signature(train_mod.train).parameters
+    params = inspect.signature(getattr(train_mod, func)).parameters
     assert "edge_loss" not in params, (
-        "train() must not take a parameter named `edge_loss`: the epoch loop "
-        "rebinds that name to the loss value"
+        f"{func}() must not take a parameter named `edge_loss` -- it rebinds that "
+        f"name to a loss tensor, silently corrupting the config after one iteration"
     )
+    assert "edge_loss_mode" in params
+
+
+def test_the_rebinding_that_motivates_the_rename_still_exists() -> None:
+    """If these assignments ever disappear, the rename above can be reconsidered."""
     assert "edge_loss, det_loss = train_epoch(" in _SOURCE
+    assert "edge_loss = sum(block_losses)" in _SOURCE
+
+
+_CONFIG_PARAMS = {
+    # `edge_loss` is listed deliberately: it is the name that caused the original
+    # failure, and both functions still assign it, so reintroducing it as a
+    # parameter anywhere must fail this test.
+    "edge_loss",
+    "edge_loss_mode", "edge_sigmoid_weight", "edge_focal_gamma", "edge_null_logit",
+    "train_gate_um", "detection_loss", "pu_gate_power", "model_select",
+    "freeze_unet", "init_from", "method",
+}
+
+
+def test_config_parameters_are_never_reassigned_in_their_own_body() -> None:
+    """Generic guard for the bug class that killed a GPU run.
+
+    A configuration parameter that its own function reassigns is silently
+    corrupted partway through: the value is right on the first iteration and
+    wrong on every one after. Signature checks cannot see this, so scan the AST.
+
+    Deliberately limited to config-like names -- rebinding a *data* parameter
+    (e.g. `logits = logits.masked_fill(...)`) is idiomatic and fine.
+    """
+    import ast
+
+    offenders = []
+    for fn in (n for n in ast.walk(ast.parse(_SOURCE)) if isinstance(n, ast.FunctionDef)):
+        params = {a.arg for a in list(fn.args.args) + list(fn.args.kwonlyargs)}
+        assigned: set[str] = set()
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        assigned.add(tgt.id)
+                    elif isinstance(tgt, ast.Tuple):
+                        assigned.update(e.id for e in tgt.elts if isinstance(e, ast.Name))
+        clobbered = params & assigned & _CONFIG_PARAMS
+        if clobbered:
+            offenders.append((fn.name, sorted(clobbered)))
+
+    assert not offenders, (
+        f"config parameters reassigned inside their own function: {offenders}"
+    )
 
 
 def test_compute_loss_defaults_are_the_legacy_path() -> None:

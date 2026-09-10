@@ -890,7 +890,9 @@ def train_epoch(
     pool_kernel_um: float = 5.0,
     detection_loss: str = "bce",
     pu_gate_power: float = 2.0,
-    edge_loss: str = "colsoftmax",
+    # Named *_mode: the batch loop below rebinds `edge_loss` to the averaged loss
+    # tensor, so a parameter of that name is clobbered after the first batch.
+    edge_loss_mode: str = "colsoftmax",
     edge_sigmoid_weight: float = 0.0,
     edge_focal_gamma: float = 2.0,
     edge_null_logit: float = 0.0,
@@ -1009,7 +1011,7 @@ def train_epoch(
                 edge_logits, pair_target,
                 frame_det[i][2], frame_det[i + 1][2],
                 gate=pair_gate,
-                mode=edge_loss,
+                mode=edge_loss_mode,
                 sigmoid_weight=edge_sigmoid_weight,
                 focal_gamma=edge_focal_gamma,
                 null_logit=edge_null_logit,
@@ -1355,7 +1357,7 @@ def train(
             model, train_loader, optimizer, device, det_loss_weight, det_neg_weight,
             max_iters=max_iters, pool_kernel_um=pool_kernel_um,
             detection_loss=detection_loss, pu_gate_power=pu_gate_power,
-            edge_loss=edge_loss_mode,
+            edge_loss_mode=edge_loss_mode,
             edge_sigmoid_weight=edge_sigmoid_weight,
             edge_focal_gamma=edge_focal_gamma,
             edge_null_logit=edge_null_logit,
