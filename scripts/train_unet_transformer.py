@@ -32,9 +32,11 @@ import tracksdata as td
 from tracking_cellmot.io import invert_time_graph, open_dataset
 from tracking_cellmot.linking import (
     GATE_FILL,
+    distance_gate,
     focal_bce_from_logits,
     focal_bce_from_logp,
     null_log_softmax,
+    pair_distance_um,
 )
 from tracking_cellmot.models import SimpleNodeTransformer, TemporalUNet3D
 
@@ -141,14 +143,23 @@ def compute_batch_loss(
     target: torch.Tensor,
     mask_t: torch.Tensor,
     mask_t1: torch.Tensor,
+    *,
+    gate: torch.Tensor | None = None,
+    **loss_kwargs,
 ) -> torch.Tensor:
-    """Compute loss over a batch by slicing out real (unpadded) regions."""
+    """Compute loss over a batch by slicing out real (unpadded) regions.
+
+    Extra keyword arguments are forwarded to :func:`compute_loss`; passing none
+    reproduces the legacy behaviour exactly.
+    """
     B = logits.shape[0]
     losses = []
     for b in range(B):
         nt = mask_t[b].sum().item()
         nt1 = mask_t1[b].sum().item()
-        losses.append(compute_loss(logits[b, :nt, :nt1], target[b, :nt, :nt1]))
+        g = gate[b, :nt, :nt1] if gate is not None else None
+        losses.append(compute_loss(
+            logits[b, :nt, :nt1], target[b, :nt, :nt1], gate=g, **loss_kwargs))
     return torch.stack(losses).mean()
 
 
@@ -879,6 +890,12 @@ def train_epoch(
     pool_kernel_um: float = 5.0,
     detection_loss: str = "bce",
     pu_gate_power: float = 2.0,
+    edge_loss: str = "colsoftmax",
+    edge_sigmoid_weight: float = 0.0,
+    edge_focal_gamma: float = 2.0,
+    edge_null_logit: float = 0.0,
+    train_gate_um: float = float("inf"),
+    freeze_unet: bool = False,
 ) -> tuple[float, float]:
     """Train for one epoch, return (avg edge loss, avg detection loss).
 
@@ -886,6 +903,14 @@ def train_epoch(
     iterations have been performed, regardless of dataset size.
     """
     model.train()
+    if freeze_unet:
+        # Must come AFTER model.train(): BatchNorm otherwise keeps using batch
+        # statistics and updating its running estimates even with
+        # requires_grad=False, so a "frozen" UNet would still drift -- and its
+        # detections would keep diverging from the ones inference sees, which use
+        # the running stats.
+        model.unet.eval()
+        model.detect_head.eval()
     total_edge_loss = 0.0
     total_det_loss = 0.0
     n_samples = 0
@@ -919,7 +944,15 @@ def train_epoch(
         B, W = imgs.shape[:2]
 
         # --- 1. Encode: UNet features + detection logits --------------------
-        unet_out, det_logits = model.encode(imgs)
+        if freeze_unet:
+            # The UNet's outputs are constants now, so skipping the graph avoids
+            # its backward pass and the gradient-checkpoint recompute entirely.
+            # Gradients still reach the transformer, whose projection is the
+            # first learnable layer.
+            with torch.no_grad():
+                unet_out, det_logits = model.encode(imgs)
+        else:
+            unet_out, det_logits = model.encode(imgs)
         # unet_out: (B, W, C, *spatial),  det_logits: list of W × (B, 1, *spatial)
 
         # --- 2. Detection loss over all W frames ---------------------------
@@ -964,9 +997,22 @@ def train_epoch(
                 frame_det[i][1], frame_det[i + 1][1],
                 frame_det[i][2], frame_det[i + 1][2],
             )
+            # Physically implausible pairs are excluded from the loss entirely, so
+            # training normalises over the same candidate set inference will use.
+            pair_gate = None
+            if np.isfinite(train_gate_um):
+                pair_gate = distance_gate(
+                    pair_distance_um(frame_det[i][0], frame_det[i + 1][0], voxel_size),
+                    train_gate_um,
+                )
             block_losses.append(compute_batch_loss(
                 edge_logits, pair_target,
                 frame_det[i][2], frame_det[i + 1][2],
+                gate=pair_gate,
+                mode=edge_loss,
+                sigmoid_weight=edge_sigmoid_weight,
+                focal_gamma=edge_focal_gamma,
+                null_logit=edge_null_logit,
             ))
         edge_loss = sum(block_losses) / len(block_losses)
 
@@ -1115,6 +1161,17 @@ def train(
     augmentations: list | None = DEFAULT_AUGMENTATIONS,
     pool_kernel_um: float = 5.0,
     data_parallel: bool = True,
+    # NB: named *_mode, not `edge_loss` -- the epoch loop below rebinds
+    # `edge_loss` to the returned loss value, which would clobber a parameter
+    # of that name after the first epoch.
+    edge_loss_mode: str = "colsoftmax",
+    edge_sigmoid_weight: float = 0.0,
+    edge_focal_gamma: float = 2.0,
+    edge_null_logit: float = 0.0,
+    train_gate_um: float = float("inf"),
+    init_from: Path | None = None,
+    freeze_unet: bool = False,
+    model_select: str = "legacy",
 ) -> UNetNodeTransformer:
     """Train on one fold from a pre-computed splits file.
 
@@ -1153,12 +1210,25 @@ def train(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Save arch config so predict_unet_transformer can reconstruct the model.
+    # The linking entries are what inference must match: an activation trained
+    # with a null slot is miscalibrated if scored without one, so these become
+    # the inference defaults rather than being re-specified by hand.
+    _INFERENCE_ACTIVATION = {
+        "colsoftmax": "softmax",
+        "parental": "softmax_null",
+        "dual": "dual_softmax_null",
+        "sigmoid": "sigmoid",
+    }
     model_config = {
         "unet_out_channels": unet_out_channels,
         "unet_layers": unet_layers,
         "downsample": list(downsample),
         "window_size": window_size,
         "pool_kernel_um": pool_kernel_um,
+        "edge_loss": edge_loss_mode,
+        "edge_activation": _INFERENCE_ACTIVATION[edge_loss_mode],
+        "null_logit": edge_null_logit,
+        "gate_um": None if train_gate_um == float("inf") else train_gate_um,
     }
     (output_dir / "config.json").write_text(json.dumps(model_config, indent=2))
 
@@ -1193,6 +1263,11 @@ def train(
     g = None
     worker_init_fn = None
     if seed is not None:
+        # torch.manual_seed was never called, so weight init and dropout were
+        # unseeded and "identical" A/B arms were not actually reproducible.
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
         g = torch.Generator()
         g.manual_seed(seed)
 
@@ -1233,6 +1308,19 @@ def train(
         pos_feat_dim=pos_feat_dim,
     ).to(device)
 
+    # Warm start from a full checkpoint (before any DataParallel wrapping, which
+    # would rename the state-dict keys).
+    if init_from is not None:
+        state = torch.load(init_from, map_location=device, weights_only=True)
+        model.load_state_dict(state)
+        print(f"  init-from: loaded {init_from}", flush=True)
+
+    if freeze_unet:
+        model.unet.requires_grad_(False)
+        model.detect_head.requires_grad_(False)
+        print("  freeze-unet: UNet + detection head frozen -- node_recall is held "
+              "fixed, so an A/B isolates the linking change", flush=True)
+
     # Simple multi-GPU: split the heavy UNet pass across all visible GPUs.
     # Only the UNet is wrapped (it takes/returns plain batched tensors); the
     # detection head and transformer stay on cuda:0. Checkpoints are saved with
@@ -1251,10 +1339,11 @@ def train(
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}", flush=True)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=lr)
     print(f"Starting training for {n_epochs} epochs (batch_size={batch_size})...", flush=True)
 
-    best_score = 0.0
+    best_score = float("-inf")
     save_path = output_dir / "edge_predictor_best.pth"
     pbar = tqdm(range(n_epochs), desc="Training", disable=False)
     print(f"Detection loss: type={detection_loss}, weight={det_loss_weight}, "
@@ -1266,6 +1355,12 @@ def train(
             model, train_loader, optimizer, device, det_loss_weight, det_neg_weight,
             max_iters=max_iters, pool_kernel_um=pool_kernel_um,
             detection_loss=detection_loss, pu_gate_power=pu_gate_power,
+            edge_loss=edge_loss_mode,
+            edge_sigmoid_weight=edge_sigmoid_weight,
+            edge_focal_gamma=edge_focal_gamma,
+            edge_null_logit=edge_null_logit,
+            train_gate_um=train_gate_um,
+            freeze_unet=freeze_unet,
         )
         train_time = time.monotonic() - t0
 
@@ -1273,8 +1368,16 @@ def train(
         test_loss, test_acc, test_recall = evaluate(model, test_loader, device, pool_kernel_um=pool_kernel_um)
         test_time = time.monotonic() - t0
 
-        score = test_acc * test_recall
-        is_best = score >= best_score
+        # `test_acc` carries almost no linking signal: the supervised mask is
+        # ~99.9% negatives, so a constant, an all-zero and a random model all
+        # score the same accuracy.  `acc * recall` therefore collapses to
+        # `recall`, which is CONSTANT when the UNet is frozen -- and with the old
+        # `>=` comparison that saved every epoch, i.e. the last one, arbitrarily.
+        # Selecting on the held-out edge loss actually discriminates between
+        # epochs.  (It is comparable within a run, not across arms with different
+        # loss modes -- across arms the real CV predict is the arbiter.)
+        score = -test_loss if model_select == "loss" else test_acc * test_recall
+        is_best = score > best_score
 
         if is_best:
             best_score = score
@@ -1294,7 +1397,7 @@ def train(
             flush=True,
         )
 
-    print(f"\nBest score (acc*recall): {best_score:.4f}, saved to {save_path}", flush=True)
+    print(f"\nBest score ({model_select}): {best_score:.4f}, saved to {save_path}", flush=True)
     if save_path.exists():
         state = torch.load(save_path, map_location=device, weights_only=True)
         if isinstance(model.unet, nn.DataParallel):
@@ -1353,6 +1456,40 @@ def main() -> None:
                              "when more than one is available (default: on).")
     parser.add_argument("--single-gpu", dest="data_parallel", action="store_false",
                         help="Disable multi-GPU; train on cuda:0 only.")
+    parser.add_argument("--edge-loss", type=str, default="colsoftmax",
+                        choices=["colsoftmax", "parental", "dual", "sigmoid"],
+                        help="Edge loss. 'colsoftmax' (default) is the legacy column "
+                             "softmax: it forces every child to take a parent, which is "
+                             "why the model over-predicts divisions ~35x. 'dual' adds null "
+                             "slots on BOTH axes, regulating out-degree (the measured "
+                             "failure mode). 'parental' is the in-degree-only form; "
+                             "'sigmoid' is per-edge and invariant to candidate count.")
+    parser.add_argument("--edge-sigmoid-weight", type=float, default=0.0,
+                        help="Weight of an auxiliary per-edge BCE added to the softmax "
+                             "losses (Trackastra uses 1e-2).")
+    parser.add_argument("--edge-focal-gamma", type=float, default=2.0,
+                        help="Focal exponent for the edge loss (default 2.0; 0 = plain BCE).")
+    parser.add_argument("--edge-null-logit", type=float, default=0.0,
+                        help="Logit of the null ('no parent') slot for the null-slot losses.")
+    parser.add_argument("--train-gate-um", type=float, default=float("inf"),
+                        help="Exclude candidate pairs beyond N microns from the edge loss so "
+                             "training normalises over the candidate set inference uses "
+                             "(default inf = off). Median true displacement is ~1.8 um.")
+    parser.add_argument("--init-from", type=str, default=None,
+                        help="Warm-start from a full checkpoint (for fine-tuning).")
+    parser.add_argument("--freeze-unet", action="store_true",
+                        help="Freeze the UNet + detection head, and switch them to eval() so "
+                             "BatchNorm stops updating. Holds node_recall fixed so an A/B "
+                             "isolates the linking change, and is ~3-4x faster.")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed torch/CUDA/dataloader. Without it weight init and dropout "
+                             "are unseeded, so 'identical' A/B arms are not reproducible.")
+    parser.add_argument("--model-select", type=str, default="legacy",
+                        choices=["legacy", "loss"],
+                        help="Best-epoch criterion. 'legacy' is acc*recall, which is "
+                             "degenerate (accuracy is ~99.9%% negatives) and constant under "
+                             "--freeze-unet, so it saves the last epoch arbitrarily. 'loss' "
+                             "selects the lowest held-out edge loss and actually discriminates.")
 
     args = parser.parse_args()
 
@@ -1390,6 +1527,15 @@ def main() -> None:
             window_size=args.window_size,
             pool_kernel_um=args.pool_kernel_um,
             data_parallel=args.data_parallel,
+            edge_loss_mode=args.edge_loss,
+            edge_sigmoid_weight=args.edge_sigmoid_weight,
+            edge_focal_gamma=args.edge_focal_gamma,
+            edge_null_logit=args.edge_null_logit,
+            train_gate_um=args.train_gate_um,
+            init_from=Path(args.init_from) if args.init_from else None,
+            freeze_unet=args.freeze_unet,
+            seed=args.seed,
+            model_select=args.model_select,
         )
 
 
