@@ -841,6 +841,10 @@ def main() -> None:
                              "so experiments are comparable.")
     parser.add_argument("--run-name", type=str, default=None,
                         help="Label for this run in --log-csv (defaults to --method).")
+    parser.add_argument("--no-det-tta", dest="det_tta", action="store_false", default=True,
+                        help="Disable flip-xy detection TTA (ON by default). TTA runs 4 forward "
+                             "passes per window, so disabling it makes the detection pass ~4x "
+                             "faster -- useful for wide inference sweeps, and lets us ablate it.")
     parser.add_argument("--use-ilp", action="store_true",
                         help="Post-process the predicted graph with the tracksdata ILP "
                              "solver (global, flow-consistent linking) instead of greedy "
@@ -871,6 +875,7 @@ def main() -> None:
         max_out_degree=args.max_out_degree,
         max_in_degree=args.max_in_degree,
         min_track_nodes=args.min_track_nodes,
+        det_tta=args.det_tta,
         use_ilp=args.use_ilp,
         ilp_edge_weight=args.ilp_edge_weight,
         ilp_appearance_weight=args.ilp_appearance_weight,
