@@ -225,6 +225,46 @@ def greedy_select(
     return out
 
 
+def optimal_assign(probs, threshold: float) -> list[tuple[int, int, float]]:
+    """Globally optimal one-to-one matching, as ``(src, tgt, prob)`` triples.
+
+    ``greedy_select`` commits to the single best edge first and lets later,
+    jointly-better combinations fall victim to it: if source A and B both want
+    target X, greedy gives X to whoever scores higher and leaves the loser with
+    its second choice, even when swapping would raise the total. A rectangular
+    linear-sum assignment maximises the summed log-probability instead, and
+    enforces one parent / one child structurally rather than by a cap.
+
+    Pairs at or below *threshold* are made effectively forbidden and dropped
+    afterwards, so a node is left unlinked rather than forced into a bad match
+    (births and deaths are real, and an unlinked node is cheaper than a wrong
+    edge). Divisions are out of reach here by construction -- a matching cannot
+    give one parent two children -- which is fine, because the measured division
+    TP is 0 either way.
+    """
+    import numpy as _np
+    from scipy.optimize import linear_sum_assignment
+
+    probs = _np.asarray(probs, dtype=_np.float64)
+    if probs.size == 0:
+        return []
+
+    # Maximise sum(log p) == minimise sum(-log p); log keeps the objective a
+    # likelihood rather than an arbitrary linear score.
+    with _np.errstate(divide="ignore"):
+        cost = -_np.log(_np.clip(probs, 1e-12, None))
+    forbidden = probs <= threshold
+    if forbidden.all():
+        return []
+    # Finite, not inf: an all-forbidden row/column would otherwise make the
+    # solver fail outright instead of simply leaving that node unmatched.
+    cost[forbidden] = 1e6
+
+    rows, cols = linear_sum_assignment(cost)
+    return [(int(r), int(c), float(probs[r, c]))
+            for r, c in zip(rows, cols) if not forbidden[r, c]]
+
+
 def pair_distance_um(
     coords_a: torch.Tensor,
     coords_b: torch.Tensor,

@@ -24,7 +24,12 @@ import tracksdata as td
 
 from tracking_cellmot.io import open_dataset, save_graph
 # Single shared implementation so training and inference cannot drift apart.
-from tracking_cellmot.linking import GATE_FILL, edge_probs as _edge_probs, greedy_select
+from tracking_cellmot.linking import (
+    GATE_FILL,
+    edge_probs as _edge_probs,
+    greedy_select,
+    optimal_assign,
+)
 
 # Import model and helpers from companion training script.
 sys.path.insert(0, str(Path(__file__).parent))
@@ -106,6 +111,13 @@ class PredictConfig:
     # division recall is bought a few edges at a time instead of all at once.
     division_threshold: float | None = None   # None = off (cap governs alone)
     division_max_children: int = 2            # hard ceiling on a fork
+    # Motion.  Cells have momentum, so where a cell is heading predicts its next
+    # position better than where it is.  Scores use d(x_t + alpha*v_t, x_t+1);
+    # 0.0 is the static distance, 1.0 is full constant-velocity extrapolation.
+    motion_alpha: float = 0.0
+    # Assignment.  "greedy" takes the best edge first and can strand a globally
+    # better pairing; "hungarian" maximises the total log-probability instead.
+    assign: str = "greedy"            # "greedy" | "hungarian"
 
     # ILP post-processing
     use_ilp: bool = False
@@ -538,6 +550,10 @@ def predict_video(
     coord_offset: dict[int, tuple[int, int]] = {}
     global_node_count: int = 0
     all_edges: list[tuple[int, int, float, float]] = []
+    # node -> its chosen parent, for the constant-velocity motion estimate.
+    # Windows advance in increasing t with stride W-1, so the (t-1, t) links are
+    # already settled by the time (t, t+1) is scored.
+    parent_of: dict[int, int] = {}
 
     # Sliding windows with stride W-1 cover every consecutive pair exactly once.
     stride = max(W - 1, 1)
@@ -642,6 +658,26 @@ def predict_video(
             vs_np = np.asarray(voxel_size, dtype=np.float32)
             d_um = np.linalg.norm((cs[:, None, :] - ct[None, :, :]) * vs_np, axis=-1)
 
+            # Motion-corrected distance. A cell has momentum, so the best
+            # predictor of where it lands is not where it *is* but where it is
+            # heading: x_t + alpha * v_t, with v_t taken from the link that
+            # already brought it into frame t. Nodes with no parent yet (first
+            # frame, or a track that just appeared) fall back to v = 0, i.e.
+            # exactly the static distance. Only the SCORE uses this; the gate
+            # stays on the raw separation, which is the physical-plausibility
+            # check and should not move with a velocity estimate.
+            d_score = d_um
+            if cfg.motion_alpha:
+                vel = np.zeros((n_src, 3), dtype=np.float32)
+                for k, gi in enumerate(idx_src):
+                    gp = parent_of.get(int(gi))
+                    if gp is not None:
+                        vel[k] = (coords_so_far[int(gi), 1:].astype(np.float32)
+                                  - coords_so_far[gp, 1:].astype(np.float32))
+                pred = cs + cfg.motion_alpha * vel
+                d_score = np.linalg.norm(
+                    (pred[:, None, :] - ct[None, :, :]) * vs_np, axis=-1)
+
             if cfg.linker == "geometry":
                 # Diagnostic ablation: score pairs by proximity alone, bypassing
                 # the learned model entirely. Detections, gate, activation,
@@ -651,7 +687,7 @@ def predict_video(
                 # softmax a Boltzmann distribution over candidate parents with
                 # temperature T microns, so the existing threshold stays meaningful.
                 raw = torch.from_numpy(
-                    (-d_um / cfg.geometry_temp_um).astype(np.float32)
+                    (-d_score / cfg.geometry_temp_um).astype(np.float32)
                 ).to(device)
             else:
                 unet_feat_src = model._index_features(
@@ -684,19 +720,26 @@ def predict_video(
 
             # One shared decision rule (see tracking_cellmot.linking): keeping a
             # second copy here is how train/inference silently drift apart.
-            for i, j, prob in greedy_select(
-                probs, cfg.threshold,
-                max_children=cfg.max_children_per_node,
-                max_parents=cfg.max_parents_per_node,
-                division_threshold=cfg.division_threshold,
-                division_max_children=cfg.division_max_children,
-            ):
+            if cfg.assign == "hungarian":
+                picked = optimal_assign(probs, cfg.threshold)
+            else:
+                picked = greedy_select(
+                    probs, cfg.threshold,
+                    max_children=cfg.max_children_per_node,
+                    max_parents=cfg.max_parents_per_node,
+                    division_threshold=cfg.division_threshold,
+                    division_max_children=cfg.division_max_children,
+                )
+
+            for i, j, prob in picked:
                 gi, gj = int(idx_src[i]), int(idx_tgt[j])
                 dist = float(np.linalg.norm(
                     coords_so_far[gi, 1:].astype(np.float32)
                     - coords_so_far[gj, 1:].astype(np.float32)
                 ))
                 all_edges.append((gi, gj, float(prob), dist))
+                # Feeds the velocity estimate for the NEXT frame pair.
+                parent_of[gj] = gi
 
         del unet_out
 
@@ -838,6 +881,8 @@ def predict(
                 "geometry_temp_um": cfg.geometry_temp_um,
                 "division_threshold": cfg.division_threshold,
                 "division_max_children": cfg.division_max_children,
+                "motion_alpha": cfg.motion_alpha,
+                "assign": cfg.assign,
                 "max_children_per_node": cfg.max_children_per_node,
                 "max_parents_per_node": cfg.max_parents_per_node,
                 "det_tta": cfg.det_tta,
@@ -927,6 +972,20 @@ def main() -> None:
     parser.add_argument("--division-max-children", type=int, default=2,
                         help="Hard ceiling on children when --division-threshold admits a "
                              "fork (default 2).")
+    parser.add_argument("--motion-alpha", type=float, default=0.0,
+                        help="Constant-velocity extrapolation weight. Scores use "
+                             "d(x_t + alpha*v_t, x_t+1), where v_t comes from the link "
+                             "that brought the cell into frame t. 0 = static distance "
+                             "(default), 1 = full extrapolation. Nodes with no parent yet "
+                             "fall back to v=0. Only the score moves; the gate stays on "
+                             "raw separation.")
+    parser.add_argument("--assign", type=str, default="greedy",
+                        choices=["greedy", "hungarian"],
+                        help="Edge selection. 'greedy' takes the highest-probability edge "
+                             "first, which can strand a jointly better pairing. 'hungarian' "
+                             "maximises total log-probability over a one-to-one matching "
+                             "(so it cannot emit divisions -- measured division TP is 0 "
+                             "regardless).")
     parser.add_argument("--max-children-per-node", type=int, default=None,
                         help="Greedy cap on outgoing edges per node (default 2; 1 = no divisions).")
     parser.add_argument("--max-parents-per-node", type=int, default=None,
@@ -983,6 +1042,8 @@ def main() -> None:
         geometry_temp_um=args.geometry_temp_um,
         division_threshold=args.division_threshold,
         division_max_children=args.division_max_children,
+        motion_alpha=args.motion_alpha,
+        assign=args.assign,
         max_children_per_node=args.max_children_per_node,
         max_parents_per_node=args.max_parents_per_node,
         use_ilp=args.use_ilp,
