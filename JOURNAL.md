@@ -511,3 +511,45 @@ Full 19-video fold, geometry linker, gate 9 (control reproduced 0.7152 exactly):
 Best: 0.7169. Every linking refinement we have tried now lands within ~0.002 of
 plain distance. Whatever separates us from the leaderboard is not in the edge
 score or the assignment rule.
+
+## 2026-09-11 (cont.) — Leaderboard reality check: we are undertrained, not mis-designed
+
+### Where the competition actually is
+- **We have never submitted** (`kaggle competitions submissions`: none).
+- Public LB top is 0.970; the top 20 are all >= 0.953.
+- Several top public notebooks are titled "metric hack". The hack (read in full)
+  appends a synthetic hub node at t=-1000, coords -10000 -- off the image --
+  with edges to up to 1400 track roots, plus fabricated divider/child chains.
+  A clean public notebook states **"Kaggle has addressed the historical metric
+  exploit, so 0.908 is treated as the legitimate clean baseline"**, and notes
+  the patched scorer caps out-degree at 2. We will not use any exploit: it is
+  patched, and worthless for publication regardless.
+- Clean public pipelines install from offline wheels, which strongly suggests
+  submissions run with **internet disabled** -- our `git clone` + `pip` setup
+  would fail at scoring. (Unverified; check the submission settings in the UI.)
+
+### Calibration: our local CV is on the leaderboard's scale
+The clean 0.908-LB pipeline scores **0.879 local CV** (8 videos, 7 um match,
+official-spec scorer). So local CV tracks LB, and our 0.717 is genuinely ~0.16
+behind -- not a scale artifact. The decisive difference is **node_recall 0.980
+(theirs) vs 0.943 (ours)**. I previously wrote that detection "is not the
+bottleneck"; relative to the competitive regime, that was wrong.
+
+### Root cause: our checkpoint saw ~3% of the standard training
+Our vendored checkpoint came from `--epochs 6 --max-iters 4000 --batch-size 1`
+(~24k window-samples). The public support pack's trainer has the **same
+upstream recipe and defaults** (50 epochs, lr 1e-4, batch 16; 64-line diff),
+run to completion (~845k window-samples, ~35x ours; its manifest says
+"400ep-snapshot", so possibly more).
+
+**Correction:** I concluded the transformer is "worthless". The evidence only
+supports that *our undertrained* transformer is. Every Tier-A, division,
+geometry and motion result was measured on a checkpoint that had barely
+trained -- the linking conclusions may not transfer to a converged model.
+
+### Why the public checkpoint cannot be validated locally
+The pack's trainer has no split fallback, so it was trained on a splits file
+of unknown content; the competition ships no `dataset_splits.json` (404). Its
+overlap with our 19 val videos is unknowable, so any local score of it is an
+optimistic upper bound. Only the leaderboard scores it honestly. Its metadata
+also carries no license field.
