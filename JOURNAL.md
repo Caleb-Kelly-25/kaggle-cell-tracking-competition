@@ -436,3 +436,55 @@ Scope-checked `_INFERENCE_ACTIVATION` by AST — assigned at :1300, loaded at
 :1313 and :1478 — since a NameError here would only appear hours into a run.
 
 111 unit tests passing.
+
+## 2026-09-10 (cont.) — Two decisive negatives: divisions are unreachable, and the transformer is worthless
+
+### The learned linker loses to pure distance
+Full 19-video validation fold, identical detections/gate/caps, only the edge
+score differs:
+
+| linker                    | score  | edge_J | node_recall |
+|---------------------------|--------|--------|-------------|
+| learned (b1_dual)         | 0.7142 | 0.7224 | 0.9423      |
+| learned (baseline ckpt)   | 0.7098 | 0.7184 | 0.9437      |
+| **geometry, -d/2um**      | **0.7152** | **0.7241** | 0.9434  |
+
+A 580k-parameter cross-attention transformer, trained for hours, is **beaten by
+the negative distance**. On the 5-video slice the learned edge was +0.0025; on
+19 videos it is -0.0010. The appearance features contribute nothing.
+
+This retroactively explains the Tier-A result. The loss line produced +0.0056
+because it was tuning the likelihood of a model whose predictions are already
+indistinguishable from proximity. No loss function fixes that.
+
+Also note the 5-video slice was **pessimistic by ~0.04** (0.674 vs 0.714), which
+is why the +/-0.06 caveat mattered: every Tier-A delta was smaller than the
+slice bias, let alone its variance.
+
+### Divisions cannot be recovered at inference
+`--division-threshold` swept across the principled band. **TP = 0 everywhere**:
+
+| threshold | score  | TP | FP  |
+|-----------|--------|----|-----|
+| off       | 0.6744 |  0 |   0 |
+| 0.70      | 0.6746 |  0 |   4 |
+| 0.65      | 0.6689 |  0 |  37 |
+| 0.60      | 0.6665 |  0 |  82 |
+| 0.55      | 0.6628 |  0 | 117 |
+| cap 2     | 0.6568 |  1 | 165 |
+
+I predicted +0.030 from this; the measured value is ~0. The 1/sqrt(2) separation
+argument was sound *in the abstract* but assumed the model assigns a clean
+two-way split at real divisions. It does not: divisions were **never
+supervised** (the `weight[div_rows] = 1.0` line was dead code), so the model has
+no mechanism to represent one. Probabilities near 0.707 are ambiguity, not
+division. Lowering the bar just harvests noise, monotonically destroying edge_J.
+
+`--max-children-per-node 1` is confirmed correct, and the division term (worth
+up to +0.1) is unreachable without supervised division training.
+
+### Where this leaves the score
+Best verified config on the full fold: **0.7152**, geometry linker, gate 9,
+nofork, node pruning. The remaining headroom is edge Jaccard (0.724 against a
+~0.89 ceiling at the current node recall) — and it will not come from a better
+loss on this architecture.
