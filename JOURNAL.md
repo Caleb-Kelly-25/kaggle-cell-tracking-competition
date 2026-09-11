@@ -488,3 +488,26 @@ Best verified config on the full fold: **0.7152**, geometry linker, gate 9,
 nofork, node pruning. The remaining headroom is edge Jaccard (0.724 against a
 ~0.89 ceiling at the current node recall) — and it will not come from a better
 loss on this architecture.
+
+## 2026-09-11 — Motion x assignment sweep: linking refinements are exhausted
+
+Full 19-video fold, geometry linker, gate 9 (control reproduced 0.7152 exactly):
+
+| run                | alpha | assign    | score  |
+|--------------------|-------|-----------|--------|
+| geom_a0_greedy     | 0.0   | greedy    | 0.7152 |
+| geom_a05_greedy    | 0.5   | greedy    | 0.7168 |
+| geom_a10_greedy    | 1.0   | greedy    | 0.7053 |
+| geom_a0_hung       | 0.0   | hungarian | 0.7153 |
+| **geom_a05_hung**  | 0.5   | hungarian | **0.7169** |
+| geom_a10_hung      | 1.0   | hungarian | 0.7057 |
+| learned_a0_hung    | 0.0   | hungarian | 0.7149 |
+
+- Half-velocity extrapolation: **+0.0016**. Full extrapolation **hurts** (-0.0099):
+  the single-step velocity estimate is noisy, so trusting it fully overshoots.
+- Optimal assignment: **+0.0001** — greedy was already near-optimal here.
+- Hungarian does **not** rescue the learned model (0.7149).
+
+Best: 0.7169. Every linking refinement we have tried now lands within ~0.002 of
+plain distance. Whatever separates us from the leaderboard is not in the edge
+score or the assignment rule.
