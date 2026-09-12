@@ -709,3 +709,32 @@ the CLI derives an upload-cache filename from the source path and mangles
 upload" *after* failing, so the run looks successful. Creating that directory
 first makes the upload work. Verified by artifact: `datasets list --mine` shows
 the dataset at 15,459,493 bytes.
+
+### Submission notebook drafted (`cellmot-submit`, not yet pushed)
+Confirmations that shaped it:
+- Kaggle **auto-extracted** our uploaded zip, so the code mounts directly as
+  `/kaggle/input/cellmot-repo/{scripts,src,checkpoints}` — no unzip step. All
+  three directories verified present, including the current 49.7 KB
+  `predict_unet_transformer.py`.
+- `sample_submission.csv` header is
+  `id,dataset,row_type,node_id,t,z,y,x,source_id,target_id`, which is exactly our
+  `geffs_to_csv` `COLUMNS` with `id` prepended. No writer change needed.
+
+Design points, each forced by something already learned the hard way:
+- `enable_internet: false`, so **no git clone and no PyPI**; dependencies install
+  with `pip --no-index --find-links <pack>/wheels`, deliberately excluding
+  numpy/scipy/torch/pandas/dask (upgrading those under a running kernel is what
+  broke `import numpy` in this project before).
+- The input mounts are **read-only**, but `dataspec.py` resolves `predictions/`
+  and `weights/` relative to the repo root, so the repo is **copied** to
+  `/kaggle/working/repo` rather than used in place.
+- Three assertions before the CSV is trusted: every test video has a `.geff`
+  (`geffs_to_csv` globs whatever exists, so a failed video would silently vanish
+  — a public notebook has this very check commented out); the header matches
+  `sample_submission.csv`; and **no node row has `t < 0`**, which is the
+  signature of the patched metric exploit, so we can never emit one by accident.
+- Imports are exercised immediately after install, so a missing wheel fails in
+  seconds instead of after a 20-minute prediction pass.
+
+Config flags are isolated in one list, to be set from `cellmot-pack-bench`;
+the placeholder is our best verified-on-fold config (0.7169).
