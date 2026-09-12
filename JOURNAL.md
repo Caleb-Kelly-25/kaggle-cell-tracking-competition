@@ -592,3 +592,34 @@ threshold (0.96875 vs our 0.99), `--min-track-nodes 6`, our motion term, and
 their ILP settings. Absolute numbers are an optimistic upper bound because the
 pack's training split is unknown; the arms are compared against each other,
 where any contamination applies equally.
+
+## 2026-09-11 (cont.) — Submissions run with internet DISABLED
+
+Verified, not inferred: `kaggle kernels pull -m` on four top public notebooks
+(no-hack clean, harmonic-fusion, minimal-hack, 942tta) shows
+**`enable_internet: false`** on every one.
+
+**Consequence: our current notebook cannot be a submission.** Cell 1 does
+`git clone` of the fork plus `pip install` from PyPI; both fail with no network.
+An LB submission therefore needs:
+1. our code attached as a **Kaggle dataset** (or inlined in the notebook), and
+2. dependencies from **offline wheels** (the support pack ships them) or from
+   Kaggle's preinstalled set.
+
+Everything measured so far ran in *development* kernels with internet on, which
+is fine — but none of it is submissible as-is. This is the single blocker
+between our validated pipeline and a leaderboard number.
+
+### The frontier has moved past the 50-epoch pack
+The 50ep support pack is used by the older/cleaner notebooks. The **current top**
+notebooks (harmonic-fusion 174 votes, 942tta 105 votes) instead attach
+`pilkwang/biohub-deepcenter-unet3d-center-prior-v1` and
+`pilkwang/biohub-temporal-unet3d-seed314159-v1` — i.e. a dedicated **center-prior
+detector** plus a differently-seeded temporal UNet. Given that the measured
+discriminator is node_recall (0.980 vs our 0.943), a purpose-built centre
+detector is the plausible mechanism, and detection is where our remaining gap is.
+
+### Minor semantics note
+Our `--min-track-nodes N` drops nodes in connected **components** smaller than N,
+not paths of length N. For unbranched chains these agree; with a division they
+differ. Comparable to their "minimum track length 6", with that caveat.
