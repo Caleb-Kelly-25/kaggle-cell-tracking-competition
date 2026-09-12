@@ -694,3 +694,18 @@ This settles the strategy: for the competition, build on the permitted public
 artifacts (Rules Sec. 6) and contribute our own graph/post-processing work on
 top. Training our own remains the path for a publishable result afterwards,
 where 132 GPU-hours on other hardware is unremarkable.
+
+### Code dataset created (the offline-submission prerequisite)
+`michaelangel23/cellmot-repo` (private, 15.46 MB): our `scripts/`, `src/` and
+both vendored checkpoints as a single flat `cellmot_repo.zip`, so an
+internet-disabled submission notebook can unzip one known path. Asserted before
+upload that it contains no `.zarr`/`.geff` — Rules Sec. 4b forbids
+redistributing Competition Data.
+
+`kaggle datasets create` first failed with
+`[Errno 2] ... \.kaggle/uploads\C_/kdata/cellmot-repo_cellmot_repo.zip.json`:
+the CLI derives an upload-cache filename from the source path and mangles
+`C:/kdata` into `C_/kdata`, then cannot create it — and it prints "Starting
+upload" *after* failing, so the run looks successful. Creating that directory
+first makes the upload work. Verified by artifact: `datasets list --mine` shows
+the dataset at 15,459,493 bytes.
