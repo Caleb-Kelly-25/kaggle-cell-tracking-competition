@@ -623,3 +623,34 @@ detector is the plausible mechanism, and detection is where our remaining gap is
 Our `--min-track-nodes N` drops nodes in connected **components** smaller than N,
 not paths of length N. For unbranched chains these agree; with a division they
 differ. Comparable to their "minimum track length 6", with that caveat.
+
+## 2026-09-11 (cont.) — The top of the leaderboard is CLEAN, and higher than 0.908
+
+Correction to this morning's entry: I reported the honest frontier as ~0.908.
+Reading the current top notebook (`flexonafft/biohub-harmonic-fusion`, 174 votes)
+shows it is **not** an exploit -- it records `"metric_hack_used": False`, cites a
+`"fixed-90 dual-seed clean pipeline (public LB 0.913)"` and describes itself as
+`"public 0.939 base + holdout-selected post-process configuration"`. So honest
+scores of **~0.91-0.94** are real. The 0.908 figure was one clean notebook's
+baseline, not the clean ceiling.
+
+### What the honest ~0.94 recipe is made of
+1. **Dual-seed temporal UNets** — the same architecture we use, trained twice
+   (`biohub-temporal-unet3d-seed314159-v1` alongside the 50ep pack), then fused.
+2. **A DeepCenter center-prior detector** — a separate full-frame centre-heatmap
+   UNet (`biohub-deepcenter-unet3d-center-prior-v1`, `best.pt` 37.9 MB) used as a
+   **veto**: it confirms or rejects gap closures and candidate divisions at
+   thresholds ~0.25, rather than proposing nodes directly.
+3. **ILP** for globally consistent node/edge selection.
+4. **Graph post-processing**: gap closing (1- and 2-frame), minimum track length,
+   trajectory smoothing, geometrically-gated "safe" divisions.
+5. **TTA**.
+
+Two things matter for us. First, node_recall is the measured discriminator
+(0.980 vs our 0.943), and a purpose-built centre detector is exactly the
+mechanism for it -- so **detection, not linking, is where our remaining gap
+lives**, which is where today's linking work was never going to help. Second,
+the centre-detector pack ships its full trainer
+(`source_scripts/train_full_frame_center_detector.py`, 43 KB) plus
+`history.csv`, `split_manifest.json` and gate-calibration CSVs, so this is
+**reproducible by us**, not only borrowable.
