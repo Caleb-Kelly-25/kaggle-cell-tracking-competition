@@ -139,6 +139,19 @@ class PredictConfig:
             if self.max_children_per_node is None:
                 self.max_children_per_node = 2
 
+        # `motion_alpha` only reaches the score through the geometry branch --
+        # the learned linker's logits come from the model, which never sees the
+        # motion-corrected distance. Silently ignoring it cost a whole 19-video
+        # arm that scored identically to 4 decimal places with motion "on", so
+        # refuse the combination instead of pretending to honour it.
+        if self.motion_alpha and self.linker != "geometry":
+            raise ValueError(
+                f"--motion-alpha {self.motion_alpha} has no effect with "
+                f"--linker {self.linker!r}: the motion-corrected distance is only "
+                f"used to score pairs under --linker geometry. Either pass "
+                f"--linker geometry or drop --motion-alpha."
+            )
+
 
 
 # =============================================================================

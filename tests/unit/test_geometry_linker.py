@@ -103,3 +103,31 @@ def test_geometry_branch_skips_the_transformer() -> None:
     assert "predict_edges" in ast.unparse(branch.orelse), (
         "the learned path must be the else branch"
     )
+
+
+def test_motion_alpha_is_refused_where_it_would_be_a_no_op() -> None:
+    """A flag that silently does nothing cost us a whole 19-video GPU arm.
+
+    `pack_det096_mt6_a05` scored identically to four decimals -- same
+    edge_jaccard too -- with motion "enabled", because the motion-corrected
+    distance is only consumed inside the `linker == "geometry"` branch. The
+    learned linker's logits come from the model, which never sees it. So the
+    combination must raise rather than appear to work.
+    """
+    with pytest.raises(ValueError, match="has no effect"):
+        predict_mod.PredictConfig(motion_alpha=0.5)          # linker defaults to "learned"
+    with pytest.raises(ValueError, match="motion-alpha"):
+        predict_mod.PredictConfig(motion_alpha=1.0, linker="learned")
+
+
+def test_motion_alpha_is_allowed_with_the_geometry_linker() -> None:
+    cfg = predict_mod.PredictConfig(motion_alpha=0.5, linker="geometry")
+    assert cfg.motion_alpha == 0.5 and cfg.linker == "geometry"
+
+
+def test_default_config_is_unaffected_by_the_guard() -> None:
+    """alpha=0 must stay constructible -- it is every measured run to date."""
+    cfg = predict_mod.PredictConfig()
+    assert cfg.motion_alpha == 0.0 and cfg.linker == "learned"
+    # And the winning submission config (ILP, no motion) must still build.
+    assert predict_mod.PredictConfig(use_ilp=True, min_track_nodes=6).motion_alpha == 0.0
