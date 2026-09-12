@@ -20,6 +20,23 @@ linking = pytest.importorskip("tracking_cellmot.linking")
 
 _SOURCE = Path(predict_mod.__file__).read_text(encoding="utf-8")
 
+def _linker_branches() -> list[ast.If]:
+    """The `cfg.linker == "geometry"` branch(es) inside `predict_video` only.
+
+    Deliberately scoped: `PredictConfig.__post_init__` also contains an `if`
+    mentioning both `linker` and `"geometry"` (the motion-alpha no-op guard), so a
+    whole-module search matches two branches and picks the wrong one -- these
+    guards would then fail for a reason that has nothing to do with the ablation.
+    """
+    tree = ast.parse(_SOURCE)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "predict_video")
+    return [n for n in ast.walk(fn)
+            if isinstance(n, ast.If)
+            and "geometry" in ast.unparse(n.test)
+            and "linker" in ast.unparse(n.test)]
+
+
 
 def test_config_exposes_the_linker_knobs() -> None:
     cfg = predict_mod.PredictConfig()
@@ -71,13 +88,7 @@ def test_geometry_branch_changes_only_the_score_not_the_decision_rule() -> None:
     degree caps -- has to be shared between the two branches, or the comparison
     measures more than the linker.
     """
-    tree = ast.parse(_SOURCE)
-    ifs = [
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.If)
-        and "geometry" in ast.unparse(n.test)
-        and "linker" in ast.unparse(n.test)
-    ]
+    ifs = _linker_branches()
     assert len(ifs) == 1, f"expected exactly one linker branch, found {len(ifs)}"
 
     branch_src = ast.unparse(ifs[0])
@@ -91,12 +102,7 @@ def test_geometry_branch_changes_only_the_score_not_the_decision_rule() -> None:
 
 def test_geometry_branch_skips_the_transformer() -> None:
     """A bypass that still ran the model would make the diagnostic pointlessly slow."""
-    tree = ast.parse(_SOURCE)
-    branch = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.If)
-        and "geometry" in ast.unparse(n.test) and "linker" in ast.unparse(n.test)
-    )
+    branch = _linker_branches()[0]
     assert "predict_edges" not in ast.unparse(branch.body), (
         "geometry mode still calls predict_edges"
     )
