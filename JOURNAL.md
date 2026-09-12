@@ -738,3 +738,58 @@ Design points, each forced by something already learned the hard way:
 
 Config flags are isolated in one list, to be set from `cellmot-pack-bench`;
 the placeholder is our best verified-on-fold config (0.7169).
+
+## 2026-09-12 — Support-pack benchmark: undertraining WAS the gap (+0.175)
+
+Full 19-video fold, our pipeline throughout, swapping only what each row says:
+
+| arm | score | edge_J | node_recall |
+|---|---|---|---|
+| ours_learned (our 6-epoch ckpt) | 0.7098 | 0.7184 | 0.9437 |
+| **pack_learned** (weights swap only) | **0.8852** | 0.8943 | **0.9932** |
+| pack_geometry (distance linker) | 0.8619 | 0.8711 | 0.9920 |
+| pack_det096 (their 0.96875 threshold) | 0.8817 | 0.8946 | 0.9932 |
+| pack_det096_mt6 (+min-track 6) | 0.8980 | 0.8993 | 0.9780 |
+| pack_det096_mt6_a05 (+motion 0.5) | 0.8980 | 0.8993 | 0.9780 |
+| **pack_ilp** (+ILP, their weights) | **0.9062** | 0.9012 | 0.9611 |
+
+### 1. The weights swap alone is worth +0.175
+0.7098 -> 0.8852 changing nothing but the checkpoint, with node_recall
+0.9437 -> 0.9932. Undertraining was essentially the entire gap, as suspected.
+
+### 2. RETRACTION: the learned linker beats geometry on a converged model
+**0.8852 (learned) vs 0.8619 (geometry), +0.023 for the model.** Yesterday, on
+our undertrained checkpoint, geometry won by 0.0010 and I wrote that "the
+transformer is worthless". That conclusion is now formally retracted: it was an
+artefact of the checkpoint, exactly as the caveat in
+[[undertrained-checkpoint]] anticipated. Appearance features do real work once
+the model has actually trained.
+
+### 3. Their detector threshold is worse for us, not better
+det 0.96875 scores 0.8817 vs 0.8852 at our 0.99 (-0.0035). Their value is tuned
+for their full pipeline, not ours -- a reminder not to import hyperparameters
+piecemeal.
+
+### 4. `--min-track-nodes 6` is a real gain: +0.016
+0.8817 -> 0.8980. node_recall drops (0.9932 -> 0.9780) because pruning removes
+nodes, yet score rises: fewer edge FPs plus a smaller node-count penalty. This is
+the graph post-processing the public pipelines use, and it transfers.
+
+### 5. ILP is the best single addition: 0.9062
+Beats greedy+gate by +0.008 and is the top arm overall.
+
+### 6. BUG FOUND: `--motion-alpha` is a silent no-op outside the geometry linker
+`pack_det096_mt6_a05` scored **identically to 4 decimal places** with and
+without motion, including the same edge_jaccard. Cause: in `predict_video` the
+motion-corrected distance `d_score` is only *consumed* inside the
+`cfg.linker == "geometry"` branch, so with the learned linker the flag does
+nothing at all. Yesterday's +0.0016 "motion gain" was measured on the geometry
+linker, where it is real; for the learned linker the flag has always been inert.
+Needs a guard so it cannot silently do nothing. Not used by the submission config,
+so it does not affect the run being pushed.
+
+### Caveat that still stands
+The pack checkpoint is `alltrain` -- it trained on all 199 videos including our
+whole val fold -- so **0.9062 is an upper bound, not an estimate**. The clean
+public pipeline's 0.879 local CV mapped to LB 0.908, so the LB is not
+necessarily lower, but only the leaderboard settles it.
