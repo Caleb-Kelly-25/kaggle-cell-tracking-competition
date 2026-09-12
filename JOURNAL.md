@@ -553,3 +553,42 @@ of unknown content; the competition ships no `dataset_splits.json` (404). Its
 overlap with our 19 val videos is unknowable, so any local score of it is an
 optimistic upper bound. Only the leaderboard scores it honestly. Its metadata
 also carries no license field.
+
+## 2026-09-11 (cont.) — Rules resolved: external models are permitted
+
+User supplied the rules text (the page is client-side rendered; WebFetch and the
+API both return only the title, so this needed their session).
+
+- **Sec. 6a/6b — External Data and Tools:** *"You may use data other than the
+  Competition Data ... ensure the External Data is either publicly available and
+  equally accessible to use by all Participants ... at no cost"*, and *"The use
+  of external data and models is acceptable unless specifically prohibited by
+  the Host."* `pilkwang/biohub-tracking-support-pack-50ep-v1` is a free public
+  Kaggle dataset, so it qualifies on both counts.
+- **Sec. 5a — Winner License:** winners MIT-license their submission and source,
+  but *"In the event that input data or pretrained models with an incompatible
+  license are used ... you do not need to grant an open source license ... for
+  that data and/or model(s)."* So the pack's missing license field is not a
+  blocker.
+- **Sec. 5b — Winner's Obligations:** a winner must supply a description
+  detailed enough to reproduce, including *"training details, hyper-parameters"*.
+  We cannot fully document a third party's training run. This is the concrete
+  argument for eventually training our own checkpoint — not for avoiding the
+  pack now.
+- **Sec. 4b — Data Security:** do not redistribute Competition Data. Our repo
+  vendors model weights only, no data; keep it that way.
+- The supplied text contains **no Code Requirements section**, so whether
+  submissions run with internet disabled remains unverified. The pack ships
+  offline wheels, so either way we are covered.
+
+Deadline **2026-09-29** (18 days), 3409 teams, $60k. We have **zero
+submissions**, hence rank 0 regardless of local results.
+
+### Next: benchmark the pack checkpoint through OUR pipeline
+Pushed `cellmot-pack-bench`: 7 arms on the full 19-video fold, swapping only the
+weights first (`ours_learned` vs `pack_learned`) to isolate the undertraining
+effect, then re-testing geometry-vs-learned on a converged model, their detector
+threshold (0.96875 vs our 0.99), `--min-track-nodes 6`, our motion term, and
+their ILP settings. Absolute numbers are an optimistic upper bound because the
+pack's training split is unknown; the arms are compared against each other,
+where any contamination applies equally.
