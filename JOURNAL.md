@@ -654,3 +654,43 @@ the centre-detector pack ships its full trainer
 (`source_scripts/train_full_frame_center_detector.py`, 43 KB) plus
 `history.csv`, `split_manifest.json` and gate-calibration CSVs, so this is
 **reproducible by us**, not only borrowable.
+
+## 2026-09-11 (cont.) — Contamination confirmed, and training to parity is infeasible here
+
+### The public checkpoints trained on ALL 199 videos
+`biohub-temporal-unet3d-seed314159-v1` ships its provenance:
+`training_config.json` names `splits_file: "dataset_splits_alltrain.json"` with
+`train_datasets: 199`, and its `split_manifest.json` train list contains **all 19
+of our validation videos**. So that checkpoint has seen our entire val fold, and
+the 50ep pack is the same lineage ("public learned baseline artifact,
+repackaged").
+
+**Consequence:** no public artifact can be scored honestly on our local fold. The
+`cellmot-pack-bench` run now in flight is still useful, but only for
+**arm-vs-arm** comparisons (contamination applies equally to every arm) — its
+absolute numbers are upper bounds, not estimates. The leaderboard is the only
+clean scorer for anything built on these weights.
+
+### Their recipe, and what it would cost us
+From `training_config.json` + `history.csv` (epoch 400, best at 381):
+
+| setting | value |
+|---|---|
+| epochs target | 500 (snapshot at 400) |
+| lr / batch | 1e-4 / 8 |
+| max_iters | null (full epochs, not capped) |
+| det_loss_weight / neg_weight | 1.0 / 0.01 |
+| augmentations | brightness, flip |
+| **train_seconds per epoch** | **~1184 s (~20 min)** |
+| validation_recall @400 | 0.9755 |
+
+400 epochs x ~20 min = **~132 GPU-hours**. Kaggle gives ~30 GPU-h/week and the
+deadline is 2026-09-29 (18 days). **Training our own model to parity is not
+achievable in-competition** — it is 4-5 weeks of quota. Our 6-epoch checkpoint
+was not a mistake in kind, only in scale, and closing that scale gap here is
+off the table.
+
+This settles the strategy: for the competition, build on the permitted public
+artifacts (Rules Sec. 6) and contribute our own graph/post-processing work on
+top. Training our own remains the path for a publishable result afterwards,
+where 132 GPU-hours on other hardware is unremarkable.
